@@ -4,13 +4,18 @@ import Foundation
 
 enum LastFMError: LocalizedError {
     case invalidResponse
-    case api(String)
+    case api(code: Int, message: String)
     case missingCredentials
+
+    var isAuthorizationPending: Bool {
+        if case .api(let code, _) = self { return code == 14 }
+        return false
+    }
 
     var errorDescription: String? {
         switch self {
         case .invalidResponse: return "Last.fm returned an unreadable response."
-        case .api(let message): return message
+        case .api(let code, let message): return "Last.fm error \(code): \(message)"
         case .missingCredentials: return "Enter your Last.fm API key and shared secret first."
         }
     }
@@ -155,8 +160,14 @@ struct LastFMClient {
               let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw LastFMError.invalidResponse
         }
-        if let errorCode = json["error"], let message = json["message"] as? String {
-            throw LastFMError.api("Last.fm error \(errorCode): \(message)")
+        if let errorNumber = json["error"] as? NSNumber,
+           let message = json["message"] as? String {
+            throw LastFMError.api(code: errorNumber.intValue, message: message)
+        }
+        if let errorText = json["error"] as? String,
+           let errorCode = Int(errorText),
+           let message = json["message"] as? String {
+            throw LastFMError.api(code: errorCode, message: message)
         }
         return json
     }

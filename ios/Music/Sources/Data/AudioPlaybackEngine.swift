@@ -126,6 +126,10 @@ final class AudioPlaybackEngine: NSObject, PlaybackControlling {
         updateElapsedFromClock()
         state.isPlaying = false
         player.pause()
+        // AVAudioPlayerNode can be paused while AVAudioEngine continues
+        // rendering silence. On iOS 12 that leaves the system media session
+        // looking active and the lock screen can keep showing the Pause glyph.
+        engine.pause()
         historyStore?.pause()
         stopProgressTimer()
         notifyStateChange()
@@ -151,6 +155,7 @@ final class AudioPlaybackEngine: NSObject, PlaybackControlling {
             state.elapsed = currentDuration()
             state.isPlaying = false
             player.stop()
+            engine.pause()
             stopProgressTimer()
         }
         notifyStateChange()
@@ -179,6 +184,7 @@ final class AudioPlaybackEngine: NSObject, PlaybackControlling {
         historyStore?.finish(reason: .queueCleared)
         scheduleGeneration += 1
         player.stop()
+        engine.pause()
         state = QueueState()
         scheduledFiles.removeAll()
         hasScheduledAudio = false
@@ -286,6 +292,8 @@ final class AudioPlaybackEngine: NSObject, PlaybackControlling {
         } else {
             state.elapsed = currentDuration()
             state.isPlaying = false
+            player.stop()
+            engine.pause()
             stopProgressTimer()
         }
         notifyStateChange()
@@ -483,7 +491,8 @@ final class AudioPlaybackEngine: NSObject, PlaybackControlling {
             MPMediaItemPropertyAlbumTitle: track.albumTitle,
             MPMediaItemPropertyPlaybackDuration: currentDuration(),
             MPNowPlayingInfoPropertyElapsedPlaybackTime: state.elapsed,
-            MPNowPlayingInfoPropertyPlaybackRate: state.isPlaying ? 1.0 : 0.0
+            MPNowPlayingInfoPropertyPlaybackRate: state.isPlaying ? 1.0 : 0.0,
+            MPNowPlayingInfoPropertyDefaultPlaybackRate: 1.0
         ]
     }
 }

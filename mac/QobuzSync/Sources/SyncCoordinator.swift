@@ -31,7 +31,9 @@ final class SyncCoordinator: ObservableObject {
     @Published var apiKey: String
     @Published var sharedSecret: String
     @Published var authorizedUsername: String?
+    @Published var lastFMStatusMessage = "Enter your Last.fm API credentials to connect."
     @Published var isLastFMWorking = false
+    @Published var isWaitingForLastFMApproval = false
     @Published var launchAtLoginEnabled = false
 
     private let defaults = UserDefaults.standard
@@ -39,6 +41,7 @@ final class SyncCoordinator: ObservableObject {
     private var pollTimer: Timer?
     private var previousDeviceIDs = Set<String>()
     private var pollInProgress = false
+    private var authorizationTask: Task<Void, Never>?
 
     private let apiKeyDefaultsKey = "lastFMAPIKey"
     private let usernameDefaultsKey = "lastFMUsername"
@@ -56,6 +59,13 @@ final class SyncCoordinator: ObservableObject {
         apiKey = defaults.string(forKey: apiKeyDefaultsKey) ?? ""
         sharedSecret = KeychainStore.string(for: sharedSecretAccount) ?? ""
         authorizedUsername = defaults.string(forKey: usernameDefaultsKey)
+        if authorizedUsername != nil, KeychainStore.string(for: sessionKeyAccount) != nil {
+            lastFMStatusMessage = "Last.fm is connected."
+        } else if defaults.string(forKey: pendingTokenDefaultsKey) != nil {
+            lastFMStatusMessage = "Browser approval is pending."
+        } else {
+            lastFMStatusMessage = "Enter your Last.fm API credentials to connect."
+        }
         launchAtLoginEnabled = SMAppService.mainApp.status == .enabled
         playbackHistory = Self.loadHistory()
     }
@@ -70,6 +80,7 @@ final class SyncCoordinator: ObservableObject {
 
     func start() {
         guard pollTimer == nil else { return }
+        resumePendingLastFMAuthorization()
         pollForDevice()
         pollTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.pollForDevice() }
@@ -143,8 +154,10 @@ final class SyncCoordinator: ObservableObject {
         let trimmedSecret = sharedSecret.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedKey.isEmpty, !trimmedSecret.isEmpty else {
             statusMessage = LastFMError.missingCredentials.localizedDescription
+            lastFMStatusMessage = LastFMError.missingCredentials.localizedDescription
             return
         }
+        authorizationTask?.cancel()
         isLastFMWorking = true
         defaults.set(trimmedKey, forKey: apiKeyDefaultsKey)
         do {
@@ -152,6 +165,7 @@ final class SyncCoordinator: ObservableObject {
         } catch {
             isLastFMWorking = false
             statusMessage = "Could not save the shared secret: \(error.localizedDescription)"
+            lastFMStatusMessage = statusMessage
             return
         }
 
@@ -160,21 +174,30 @@ final class SyncCoordinator: ObservableObject {
                 let token = try await lastFM.requestToken(apiKey: trimmedKey, sharedSecret: trimmedSecret)
                 defaults.set(token, forKey: pendingTokenDefaultsKey)
                 if let url = lastFM.authorizationURL(apiKey: trimmedKey, token: token) {
-                    NSWorkspace.shared.open(url)
+                    _ = NSWorkspace.shared.open(url)
                 }
-                statusMessage = "Approve Qobuz Sync in your browser, then click Complete authorization."
+                apiKey = trimmedKey
+                sharedSecret = trimmedSecret
+                statusMessage = "Approve iPod Qobuz Sync on Last.fm. The app will finish automatically."
+                lastFMStatusMessage = statusMessage
+                isWaitingForLastFMApproval = true
+                isLastFMWorking = false
+                startAuthorizationPolling(token: token, apiKey: trimmedKey, sharedSecret: trimmedSecret)
             } catch {
                 statusMessage = error.localizedDescription
+                lastFMStatusMessage = statusMessage
+                isLastFMWorking = false
             }
-            isLastFMWorking = false
         }
     }
 
     func completeLastFMAuthorization() {
         guard let token = defaults.string(forKey: pendingTokenDefaultsKey) else {
             statusMessage = "Start Last.fm authorization first."
+            lastFMStatusMessage = statusMessage
             return
         }
+        authorizationTask?.cancel()
         isLastFMWorking = true
         Task {
             do {
@@ -183,28 +206,104 @@ final class SyncCoordinator: ObservableObject {
                     apiKey: apiKey,
                     sharedSecret: sharedSecret
                 )
-                try KeychainStore.set(session.key, for: sessionKeyAccount)
-                defaults.set(session.name, forKey: usernameDefaultsKey)
-                defaults.removeObject(forKey: pendingTokenDefaultsKey)
-                authorizedUsername = session.name
-                statusMessage = "Last.fm connected as \(session.name)."
+                try finishLastFMAuthorization(session)
+                isLastFMWorking = false
                 await scrobblePending()
+            } catch let error as LastFMError where error.isAuthorizationPending {
+                isLastFMWorking = false
+                isWaitingForLastFMApproval = true
+                statusMessage = "Last.fm is still waiting for browser approval."
+                lastFMStatusMessage = statusMessage
+                startAuthorizationPolling(token: token, apiKey: apiKey, sharedSecret: sharedSecret)
             } catch {
                 statusMessage = error.localizedDescription
+                lastFMStatusMessage = statusMessage
+                isLastFMWorking = false
             }
-            isLastFMWorking = false
         }
+    }
+
+    func openPendingLastFMApprovalPage() {
+        guard let token = defaults.string(forKey: pendingTokenDefaultsKey),
+              let url = lastFM.authorizationURL(apiKey: apiKey, token: token) else {
+            beginLastFMAuthorization()
+            return
+        }
+        _ = NSWorkspace.shared.open(url)
+        statusMessage = "Approve iPod Qobuz Sync on the Last.fm page that just opened."
+        lastFMStatusMessage = statusMessage
     }
 
     func disconnectLastFM() {
         KeychainStore.remove(sessionKeyAccount)
         defaults.removeObject(forKey: usernameDefaultsKey)
+        defaults.removeObject(forKey: pendingTokenDefaultsKey)
+        authorizationTask?.cancel()
         authorizedUsername = nil
+        isWaitingForLastFMApproval = false
         statusMessage = "Last.fm disconnected. Your local play history was kept."
+        lastFMStatusMessage = statusMessage
     }
 
     func scrobbleNow() {
         Task { await scrobblePending() }
+    }
+
+    private func resumePendingLastFMAuthorization() {
+        guard !hasLastFMSession,
+              let token = defaults.string(forKey: pendingTokenDefaultsKey),
+              !apiKey.isEmpty,
+              !sharedSecret.isEmpty else { return }
+        isWaitingForLastFMApproval = true
+        startAuthorizationPolling(token: token, apiKey: apiKey, sharedSecret: sharedSecret)
+    }
+
+    private func startAuthorizationPolling(
+        token: String,
+        apiKey: String,
+        sharedSecret: String
+    ) {
+        authorizationTask?.cancel()
+        authorizationTask = Task { [weak self] in
+            guard let self else { return }
+            for _ in 0..<60 {
+                if Task.isCancelled { return }
+                do {
+                    try await Task.sleep(nanoseconds: 2_000_000_000)
+                    if Task.isCancelled { return }
+                    let session = try await lastFM.requestSession(
+                        token: token,
+                        apiKey: apiKey,
+                        sharedSecret: sharedSecret
+                    )
+                    try finishLastFMAuthorization(session)
+                    await scrobblePending()
+                    return
+                } catch let error as LastFMError where error.isAuthorizationPending {
+                    continue
+                } catch is CancellationError {
+                    return
+                } catch {
+                    isWaitingForLastFMApproval = false
+                    statusMessage = error.localizedDescription
+                    lastFMStatusMessage = statusMessage
+                    return
+                }
+            }
+            isWaitingForLastFMApproval = false
+            statusMessage = "Last.fm approval timed out. Click Finish after approving, or authorize again."
+            lastFMStatusMessage = statusMessage
+        }
+    }
+
+    private func finishLastFMAuthorization(_ session: LastFMSession) throws {
+        try KeychainStore.set(session.key, for: sessionKeyAccount)
+        defaults.set(session.name, forKey: usernameDefaultsKey)
+        defaults.removeObject(forKey: pendingTokenDefaultsKey)
+        authorizedUsername = session.name
+        isWaitingForLastFMApproval = false
+        statusMessage = "Last.fm connected as \(session.name)."
+        lastFMStatusMessage = statusMessage
     }
 
     private func pollForDevice() {

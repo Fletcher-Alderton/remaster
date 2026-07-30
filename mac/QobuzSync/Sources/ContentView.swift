@@ -98,10 +98,17 @@ struct ContentView: View {
                 }
                 .textFieldStyle(.roundedBorder)
                 HStack {
-                    Button("Authorize in browser") {
-                        coordinator.beginLastFMAuthorization()
+                    if coordinator.isWaitingForLastFMApproval {
+                        Button("Open approval page") {
+                            coordinator.openPendingLastFMApprovalPage()
+                        }
+                    } else {
+                        Button("Authorize in browser") {
+                            coordinator.beginLastFMAuthorization()
+                        }
+                        .disabled(coordinator.isLastFMWorking)
                     }
-                    Button("Complete authorization") {
+                    Button("I've approved it — finish") {
                         coordinator.completeLastFMAuthorization()
                     }
                     Spacer()
@@ -111,6 +118,15 @@ struct ContentView: View {
                         coordinator.scrobbleNow()
                     }
                     .disabled(!coordinator.hasLastFMSession || coordinator.isLastFMWorking)
+                }
+                HStack(spacing: 8) {
+                    if coordinator.isWaitingForLastFMApproval {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                    Text(coordinator.lastFMStatusMessage)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
                 Text("The shared secret and Last.fm session are stored in your Mac keychain. Eligible plays upload automatically after each iPod sync.")
                     .font(.caption)

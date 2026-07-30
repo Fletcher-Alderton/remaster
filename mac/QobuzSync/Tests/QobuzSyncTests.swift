@@ -26,6 +26,11 @@ final class QobuzSyncTests: XCTestCase {
         )
     }
 
+    func testLastFMAuthorizationPendingIsRecognized() {
+        XCTAssertTrue(LastFMError.api(code: 14, message: "Unauthorized Token").isAuthorizationPending)
+        XCTAssertFalse(LastFMError.api(code: 9, message: "Invalid session key").isAuthorizationPending)
+    }
+
     func testAFCInfoOutputIsMatchedToRequestedFiles() {
         let output = "\u{001B}[0;30m\u{001B}[47mafc:\u{001B}[m\u{001B}[1;33m\u{001B}[44m/\u{001B}[m > {\n"
             + "  \"st_size\": 74889,\n  \"st_ifmt\": \"S_IFREG\"\n}\n"
