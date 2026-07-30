@@ -1,0 +1,63 @@
+import XCTest
+@testable import QobuzSync
+
+final class QobuzSyncTests: XCTestCase {
+    func testLastFMEligibilityUsesHalfOrFourMinutes() {
+        XCTAssertFalse(event(duration: 300, listened: 149).isLastFMEligible)
+        XCTAssertTrue(event(duration: 300, listened: 150).isLastFMEligible)
+        XCTAssertFalse(event(duration: 900, listened: 239).isLastFMEligible)
+        XCTAssertTrue(event(duration: 900, listened: 240).isLastFMEligible)
+        XCTAssertFalse(event(duration: 30, listened: 30).isLastFMEligible)
+        XCTAssertTrue(event(duration: 31, listened: 15.5).isLastFMEligible)
+    }
+
+    func testSignatureIsStableAndExcludesFormat() {
+        let parameters = [
+            "method": "auth.getToken",
+            "api_key": "key",
+            "format": "json"
+        ]
+        XCTAssertEqual(
+            LastFMClient.signature(parameters: parameters, sharedSecret: "secret"),
+            LastFMClient.signature(
+                parameters: ["api_key": "key", "method": "auth.getToken"],
+                sharedSecret: "secret"
+            )
+        )
+    }
+
+    func testAFCInfoOutputIsMatchedToRequestedFiles() {
+        let output = "\u{001B}[0;30m\u{001B}[47mafc:\u{001B}[m\u{001B}[1;33m\u{001B}[44m/\u{001B}[m > {\n"
+            + "  \"st_size\": 74889,\n  \"st_ifmt\": \"S_IFREG\"\n}\n"
+            + "\u{001B}[0;30m\u{001B}[47mafc:\u{001B}[m\u{001B}[1;33m\u{001B}[44m/\u{001B}[m > "
+            + "Error: Failed to get file info: Not found (8)\n"
+            + "\u{001B}[0;30m\u{001B}[47mafc:\u{001B}[m\u{001B}[1;33m\u{001B}[44m/\u{001B}[m > "
+        XCTAssertEqual(
+            USBDeviceService.parseRemoteFileSizes(
+                output,
+                relativePaths: ["Album/cover.jpg", "Album/missing.flac"]
+            ),
+            ["Album/cover.jpg": 74_889]
+        )
+    }
+
+    private func event(duration: TimeInterval, listened: TimeInterval) -> PlaybackEvent {
+        PlaybackEvent(
+            schemaVersion: 1,
+            id: UUID().uuidString,
+            trackID: "track",
+            sourceRelativePath: "Album/Track.flac",
+            title: "Track",
+            artist: "Artist",
+            album: "Album",
+            albumArtist: "Artist",
+            trackNumber: 1,
+            startedAt: Date(),
+            endedAt: Date(),
+            listenedSeconds: listened,
+            trackDuration: duration,
+            completed: false,
+            endReason: .skipped
+        )
+    }
+}

@@ -10,6 +10,7 @@ final class RootViewController: UIViewController, UIDocumentPickerDelegate {
 
     private let libraryStore = LibraryStore()
     private let appState = AppState()
+    private let playbackHistoryStore = PlaybackHistoryStore()
     private lazy var mapper = ScreenMapper(store: libraryStore)
     private lazy var playback: PlaybackControlling = AudioPlaybackEngine(
         trackProvider: { [weak self] trackID in
@@ -17,7 +18,8 @@ final class RootViewController: UIViewController, UIDocumentPickerDelegate {
         },
         fileURLProvider: { [weak self] trackID in
             self?.libraryStore.audioFileURL(for: trackID)
-        }
+        },
+        historyStore: playbackHistoryStore
     )
 
     private let tabStrip = TabStripView()

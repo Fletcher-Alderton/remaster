@@ -16,8 +16,8 @@ The deployment target is iOS 12.0 and the interface is tuned for the iPod touch
 programmatic UIKit; `LaunchScreen.storyboard` is the required static iOS launch
 resource.
 
-Audio playback is intentionally simulated. Imported files are copied into the
-application-support directory and indexed with AVFoundation.
+Audio playback uses local files through AVAudioEngine. Imported files live in
+the Finder-visible Documents directory and are indexed with AVFoundation.
 
 ## What is implemented
 
@@ -32,12 +32,13 @@ application-support directory and indexed with AVFoundation.
   Playing to return, swipe up from Now Playing to open Queue, and swipe down from
   Queue to return to Now Playing. Scrollable screens only dismiss when at the top.
 - Pull-down search/filter controls on library screens.
-- Silent playback simulation, seeking, play/pause, likes, queue changes, waveform progress,
-  and the playing/paused artwork states.
+- Local lossless playback, seeking, play/pause, likes, queue changes, waveform
+  progress, lock-screen controls, and the playing/paused artwork states.
 - Multi-file document import, background AVFoundation metadata indexing, duplicate checks,
   versioned JSON persistence, and cached/downsampled artwork.
+- Append-only JSON Lines playback history with timestamps, actual listened time,
+  track duration, completion state, and crash-safe active-play checkpoints.
 - Unit and UI test targets in the `Music` scheme.
 
-The installed Xcode currently has only an iOS 26 simulator runtime, so the project
-compiles with an iOS 12.0 deployment target but final runtime compatibility still
-needs to be confirmed on the physical iPod touch 6.
+The app is deployed to the jailbroken iPod touch through AppSync/libimobiledevice,
+so it does not require a paid Apple developer account.

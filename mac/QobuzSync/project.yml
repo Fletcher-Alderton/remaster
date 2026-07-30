@@ -1,0 +1,51 @@
+name: QobuzSync
+options:
+  bundleIdPrefix: com.fletcher
+  deploymentTarget:
+    macOS: "13.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MACOSX_DEPLOYMENT_TARGET: "13.0"
+    CODE_SIGN_STYLE: Automatic
+targets:
+  QobuzSync:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.fletcher.iPodMusicSync
+        ENABLE_APP_SANDBOX: NO
+        CODE_SIGN_IDENTITY: "-"
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: Qobuz Sync
+        CFBundleName: Qobuz Sync
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "1"
+        LSMinimumSystemVersion: "13.0"
+        NSHumanReadableCopyright: ""
+  QobuzSyncTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests
+    dependencies:
+      - target: QobuzSync
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.fletcher.iPodMusicSyncTests
+        GENERATE_INFOPLIST_FILE: YES
+schemes:
+  QobuzSync:
+    build:
+      targets:
+        QobuzSync: all
+        QobuzSyncTests: [test]
+    test:
+      targets:
+        - QobuzSyncTests

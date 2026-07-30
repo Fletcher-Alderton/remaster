@@ -2,6 +2,38 @@ import XCTest
 @testable import Music
 
 final class DataLayerTests: XCTestCase {
+    func testPlaybackHistoryRecordsActualListeningTimeAndMetadata() {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = PlaybackHistoryStore(documentsDirectory: root, checkpointInterval: 5)
+        let track = Track(
+            sourceFileName: "song.flac",
+            relativePath: "Qobuz/Album/song.flac",
+            title: "Song",
+            artist: "Artist",
+            albumTitle: "Album",
+            albumArtist: "Album Artist",
+            trackNumber: 2,
+            duration: 200
+        )
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+
+        store.begin(track: track, at: start)
+        store.checkpoint(at: start.addingTimeInterval(10))
+        store.pause(at: start.addingTimeInterval(18))
+        store.begin(track: track, at: start.addingTimeInterval(30))
+        store.finish(reason: .skipped, at: start.addingTimeInterval(42))
+
+        let event = store.readAllEvents().last
+        XCTAssertEqual(event?.trackID, track.id)
+        XCTAssertEqual(event?.sourceRelativePath, "Qobuz/Album/song.flac")
+        XCTAssertEqual(event?.startedAt, start)
+        XCTAssertEqual(event?.endedAt, start.addingTimeInterval(42))
+        XCTAssertEqual(event?.listenedSeconds ?? 0, 30, accuracy: 0.001)
+        XCTAssertEqual(event?.endReason, .skipped)
+        XCTAssertFalse(event?.completed ?? true)
+    }
+
     func testFinderVisibleMusicDirectoryUsesDocuments() {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

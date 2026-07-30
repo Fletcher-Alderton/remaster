@@ -13,6 +13,7 @@ final class AudioPlaybackEngine: NSObject, PlaybackControlling {
 
     private let trackProvider: (String) -> Track?
     private let fileURLProvider: (String) -> URL?
+    private let historyStore: PlaybackHistoryStore?
     private let audioSession = AVAudioSession.sharedInstance()
     private let engine = AVAudioEngine()
     private let player = AVAudioPlayerNode()
@@ -31,10 +32,12 @@ final class AudioPlaybackEngine: NSObject, PlaybackControlling {
 
     init(
         trackProvider: @escaping (String) -> Track?,
-        fileURLProvider: @escaping (String) -> URL?
+        fileURLProvider: @escaping (String) -> URL?,
+        historyStore: PlaybackHistoryStore? = nil
     ) {
         self.trackProvider = trackProvider
         self.fileURLProvider = fileURLProvider
+        self.historyStore = historyStore
         super.init()
 
         engine.attach(player)
@@ -47,6 +50,7 @@ final class AudioPlaybackEngine: NSObject, PlaybackControlling {
     }
 
     deinit {
+        historyStore?.finish(reason: .appTerminated)
         timer?.invalidate()
         NotificationCenter.default.removeObserver(self)
         for (command, target) in remoteCommandTargets {
@@ -58,6 +62,7 @@ final class AudioPlaybackEngine: NSObject, PlaybackControlling {
     }
 
     func setQueue(trackIDs: [String], startingAt index: Int = 0) {
+        historyStore?.finish(reason: .queueReplaced)
         let shuffled = state.isShuffled
         state = QueueState(
             trackIDs: trackIDs,
@@ -110,6 +115,7 @@ final class AudioPlaybackEngine: NSObject, PlaybackControlling {
         if hasScheduledAudio {
             startEngineIfNeeded()
             player.play()
+            beginHistoryForCurrentTrack()
         }
         startProgressTimer()
         notifyStateChange()
@@ -120,6 +126,7 @@ final class AudioPlaybackEngine: NSObject, PlaybackControlling {
         updateElapsedFromClock()
         state.isPlaying = false
         player.pause()
+        historyStore?.pause()
         stopProgressTimer()
         notifyStateChange()
     }
@@ -134,6 +141,7 @@ final class AudioPlaybackEngine: NSObject, PlaybackControlling {
 
     func next() {
         guard !state.trackIDs.isEmpty else { return }
+        historyStore?.finish(reason: .skipped)
         let autoplay = state.isPlaying
         if state.currentIndex + 1 < state.trackIDs.count {
             state.currentIndex += 1
@@ -150,6 +158,7 @@ final class AudioPlaybackEngine: NSObject, PlaybackControlling {
 
     func previous() {
         guard !state.trackIDs.isEmpty else { return }
+        historyStore?.finish(reason: state.elapsed > 3 ? .restarted : .skipped)
         let autoplay = state.isPlaying
         if state.elapsed > 3 {
             state.elapsed = 0
@@ -167,6 +176,7 @@ final class AudioPlaybackEngine: NSObject, PlaybackControlling {
     }
 
     func clearQueue() {
+        historyStore?.finish(reason: .queueCleared)
         scheduleGeneration += 1
         player.stop()
         state = QueueState()
@@ -199,7 +209,10 @@ final class AudioPlaybackEngine: NSObject, PlaybackControlling {
         if autoplay {
             state.isPlaying = true
             lastTimerDate = Date()
-            if hasScheduledAudio { player.play() }
+            if hasScheduledAudio {
+                player.play()
+                beginHistoryForCurrentTrack()
+            }
             startProgressTimer()
         }
     }
@@ -263,10 +276,13 @@ final class AudioPlaybackEngine: NSObject, PlaybackControlling {
 
     private func scheduledTrackDidFinish(index: Int, generation: Int) {
         guard generation == scheduleGeneration, index == state.currentIndex else { return }
+        let transitionDate = Date()
+        historyStore?.finish(reason: .completed, at: transitionDate)
         if index + 1 < state.trackIDs.count {
             state.currentIndex = index + 1
             state.elapsed = 0
-            lastTimerDate = Date()
+            lastTimerDate = transitionDate
+            beginHistoryForCurrentTrack(at: transitionDate)
         } else {
             state.elapsed = currentDuration()
             state.isPlaying = false
@@ -328,6 +344,7 @@ final class AudioPlaybackEngine: NSObject, PlaybackControlling {
     private func progressTimerDidFire() {
         guard state.isPlaying else { return }
         updateElapsedFromClock()
+        historyStore?.checkpoint()
         let duration = currentDuration()
         if !hasScheduledAudio, state.elapsed >= duration {
             next()
@@ -350,6 +367,14 @@ final class AudioPlaybackEngine: NSObject, PlaybackControlling {
         guard let id = state.currentTrackID else { return 0 }
         let duration = trackProvider(id)?.duration ?? 0
         return duration.isFinite && duration > 0 ? duration : AudioPlaybackEngine.fallbackDuration
+    }
+
+    private func beginHistoryForCurrentTrack(at date: Date = Date()) {
+        guard state.isPlaying,
+              hasScheduledAudio,
+              let id = state.currentTrackID,
+              let track = trackProvider(id) else { return }
+        historyStore?.begin(track: track, at: date)
     }
 
     private func notifyStateChange() {
