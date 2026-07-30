@@ -29,7 +29,9 @@ final class QobuzSyncTests: XCTestCase {
     func testLastFMAuthorizationPendingIsRecognized() {
         XCTAssertTrue(LastFMError.api(code: 14, message: "Unauthorized Token").isAuthorizationPending)
         XCTAssertFalse(LastFMError.api(code: 9, message: "Invalid session key").isAuthorizationPending)
-        XCTAssertTrue(LastFMError.api(code: 13, message: "Invalid method signature supplied").isInvalidSignature)
+        XCTAssertTrue(LastFMError.api(code: 14, message: "Unauthorized Token").requiresManualApproval)
+        XCTAssertTrue(LastFMError.api(code: 13, message: "Invalid method signature supplied").requiresManualApproval)
+        XCTAssertFalse(LastFMError.api(code: 9, message: "Invalid session key").requiresManualApproval)
     }
 
     func testLastFMReadsJSONErrorFromHTTP403() {

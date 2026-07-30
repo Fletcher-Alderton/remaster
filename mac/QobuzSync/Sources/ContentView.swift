@@ -97,10 +97,14 @@ struct ContentView: View {
                     SecureField("Shared secret", text: $coordinator.sharedSecret)
                 }
                 .textFieldStyle(.roundedBorder)
+                .disabled(coordinator.isWaitingForLastFMApproval || coordinator.isLastFMWorking)
                 HStack {
                     if coordinator.isWaitingForLastFMApproval {
                         Button("Open approval page") {
                             coordinator.openPendingLastFMApprovalPage()
+                        }
+                        Button("Start over") {
+                            coordinator.startOverLastFMAuthorization()
                         }
                     } else {
                         Button("Authorize in browser") {
@@ -121,8 +125,7 @@ struct ContentView: View {
                 }
                 HStack(spacing: 8) {
                     if coordinator.isWaitingForLastFMApproval {
-                        ProgressView()
-                            .controlSize(.small)
+                        Image(systemName: "hourglass")
                     }
                     Text(coordinator.lastFMStatusMessage)
                         .font(.caption)

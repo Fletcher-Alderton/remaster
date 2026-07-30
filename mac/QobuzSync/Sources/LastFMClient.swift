@@ -12,8 +12,11 @@ enum LastFMError: LocalizedError {
         return false
     }
 
-    var isInvalidSignature: Bool {
-        if case .api(let code, _) = self { return code == 13 }
+    var requiresManualApproval: Bool {
+        // Last.fm normally uses 14 for an unapproved desktop token, but it can
+        // also return 13 while the token/credential pair has not been accepted.
+        // Neither response should trigger another browser authorization.
+        if case .api(let code, _) = self { return code == 13 || code == 14 }
         return false
     }
 

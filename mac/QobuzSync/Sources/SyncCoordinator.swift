@@ -41,7 +41,6 @@ final class SyncCoordinator: ObservableObject {
     private var pollTimer: Timer?
     private var previousDeviceIDs = Set<String>()
     private var pollInProgress = false
-    private var authorizationTask: Task<Void, Never>?
 
     private let apiKeyDefaultsKey = "lastFMAPIKey"
     private let usernameDefaultsKey = "lastFMUsername"
@@ -157,7 +156,6 @@ final class SyncCoordinator: ObservableObject {
             lastFMStatusMessage = LastFMError.missingCredentials.localizedDescription
             return
         }
-        authorizationTask?.cancel()
         isLastFMWorking = true
         defaults.set(trimmedKey, forKey: apiKeyDefaultsKey)
         do {
@@ -178,11 +176,10 @@ final class SyncCoordinator: ObservableObject {
                 }
                 apiKey = trimmedKey
                 sharedSecret = trimmedSecret
-                statusMessage = "Approve iPod Qobuz Sync on Last.fm. The app will finish automatically."
+                statusMessage = "Approve iPod Qobuz Sync on Last.fm, then return here and click Finish."
                 lastFMStatusMessage = statusMessage
                 isWaitingForLastFMApproval = true
                 isLastFMWorking = false
-                startAuthorizationPolling(token: token, apiKey: trimmedKey, sharedSecret: trimmedSecret)
             } catch {
                 statusMessage = error.localizedDescription
                 lastFMStatusMessage = statusMessage
@@ -197,7 +194,6 @@ final class SyncCoordinator: ObservableObject {
             lastFMStatusMessage = statusMessage
             return
         }
-        authorizationTask?.cancel()
         isLastFMWorking = true
         Task {
             do {
@@ -209,15 +205,11 @@ final class SyncCoordinator: ObservableObject {
                 try finishLastFMAuthorization(session)
                 isLastFMWorking = false
                 await scrobblePending()
-            } catch let error as LastFMError where error.isAuthorizationPending {
+            } catch let error as LastFMError where error.requiresManualApproval {
                 isLastFMWorking = false
                 isWaitingForLastFMApproval = true
-                statusMessage = "Last.fm is still waiting for browser approval."
+                statusMessage = "Last.fm has not accepted this token yet. Approve the existing page, then click Finish once."
                 lastFMStatusMessage = statusMessage
-                startAuthorizationPolling(token: token, apiKey: apiKey, sharedSecret: sharedSecret)
-            } catch let error as LastFMError where error.isInvalidSignature {
-                isLastFMWorking = false
-                replaceMismatchedPendingToken()
             } catch {
                 statusMessage = error.localizedDescription
                 lastFMStatusMessage = statusMessage
@@ -237,11 +229,16 @@ final class SyncCoordinator: ObservableObject {
         lastFMStatusMessage = statusMessage
     }
 
+    func startOverLastFMAuthorization() {
+        defaults.removeObject(forKey: pendingTokenDefaultsKey)
+        isWaitingForLastFMApproval = false
+        beginLastFMAuthorization()
+    }
+
     func disconnectLastFM() {
         KeychainStore.remove(sessionKeyAccount)
         defaults.removeObject(forKey: usernameDefaultsKey)
         defaults.removeObject(forKey: pendingTokenDefaultsKey)
-        authorizationTask?.cancel()
         authorizedUsername = nil
         isWaitingForLastFMApproval = false
         statusMessage = "Last.fm disconnected. Your local play history was kept."
@@ -254,60 +251,12 @@ final class SyncCoordinator: ObservableObject {
 
     private func resumePendingLastFMAuthorization() {
         guard !hasLastFMSession,
-              let token = defaults.string(forKey: pendingTokenDefaultsKey),
+              defaults.string(forKey: pendingTokenDefaultsKey) != nil,
               !apiKey.isEmpty,
               !sharedSecret.isEmpty else { return }
         isWaitingForLastFMApproval = true
-        startAuthorizationPolling(token: token, apiKey: apiKey, sharedSecret: sharedSecret)
-    }
-
-    private func startAuthorizationPolling(
-        token: String,
-        apiKey: String,
-        sharedSecret: String
-    ) {
-        authorizationTask?.cancel()
-        authorizationTask = Task { [weak self] in
-            guard let self else { return }
-            for _ in 0..<60 {
-                if Task.isCancelled { return }
-                do {
-                    try await Task.sleep(nanoseconds: 2_000_000_000)
-                    if Task.isCancelled { return }
-                    let session = try await lastFM.requestSession(
-                        token: token,
-                        apiKey: apiKey,
-                        sharedSecret: sharedSecret
-                    )
-                    try finishLastFMAuthorization(session)
-                    await scrobblePending()
-                    return
-                } catch let error as LastFMError where error.isAuthorizationPending {
-                    continue
-                } catch let error as LastFMError where error.isInvalidSignature {
-                    replaceMismatchedPendingToken()
-                    return
-                } catch is CancellationError {
-                    return
-                } catch {
-                    isWaitingForLastFMApproval = false
-                    statusMessage = error.localizedDescription
-                    lastFMStatusMessage = statusMessage
-                    return
-                }
-            }
-            isWaitingForLastFMApproval = false
-            statusMessage = "Last.fm approval timed out. Click Finish after approving, or authorize again."
-            lastFMStatusMessage = statusMessage
-        }
-    }
-
-    private func replaceMismatchedPendingToken() {
-        defaults.removeObject(forKey: pendingTokenDefaultsKey)
-        isWaitingForLastFMApproval = false
-        statusMessage = "The old approval token used different credentials. Starting a fresh authorization…"
+        statusMessage = "Browser approval is pending. Approve the existing page, then click Finish."
         lastFMStatusMessage = statusMessage
-        beginLastFMAuthorization()
     }
 
     private func finishLastFMAuthorization(_ session: LastFMSession) throws {
