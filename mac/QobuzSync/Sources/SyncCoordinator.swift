@@ -215,6 +215,9 @@ final class SyncCoordinator: ObservableObject {
                 statusMessage = "Last.fm is still waiting for browser approval."
                 lastFMStatusMessage = statusMessage
                 startAuthorizationPolling(token: token, apiKey: apiKey, sharedSecret: sharedSecret)
+            } catch let error as LastFMError where error.isInvalidSignature {
+                isLastFMWorking = false
+                replaceMismatchedPendingToken()
             } catch {
                 statusMessage = error.localizedDescription
                 lastFMStatusMessage = statusMessage
@@ -281,6 +284,9 @@ final class SyncCoordinator: ObservableObject {
                     return
                 } catch let error as LastFMError where error.isAuthorizationPending {
                     continue
+                } catch let error as LastFMError where error.isInvalidSignature {
+                    replaceMismatchedPendingToken()
+                    return
                 } catch is CancellationError {
                     return
                 } catch {
@@ -294,6 +300,14 @@ final class SyncCoordinator: ObservableObject {
             statusMessage = "Last.fm approval timed out. Click Finish after approving, or authorize again."
             lastFMStatusMessage = statusMessage
         }
+    }
+
+    private func replaceMismatchedPendingToken() {
+        defaults.removeObject(forKey: pendingTokenDefaultsKey)
+        isWaitingForLastFMApproval = false
+        statusMessage = "The old approval token used different credentials. Starting a fresh authorization…"
+        lastFMStatusMessage = statusMessage
+        beginLastFMAuthorization()
     }
 
     private func finishLastFMAuthorization(_ session: LastFMSession) throws {

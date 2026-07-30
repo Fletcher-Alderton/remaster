@@ -12,6 +12,11 @@ enum LastFMError: LocalizedError {
         return false
     }
 
+    var isInvalidSignature: Bool {
+        if case .api(let code, _) = self { return code == 13 }
+        return false
+    }
+
     var errorDescription: String? {
         switch self {
         case .invalidResponse: return "Last.fm returned an unreadable response."
