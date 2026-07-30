@@ -156,8 +156,17 @@ struct LastFMClient {
         }
 
         let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
-              let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        guard let http = response as? HTTPURLResponse else {
+            throw LastFMError.invalidResponse
+        }
+        return try Self.decodeResponse(data: data, httpStatus: http.statusCode)
+    }
+
+    static func decodeResponse(data: Data, httpStatus: Int) throws -> [String: Any] {
+        // Last.fm explicitly requires clients to inspect the response body
+        // even when the HTTP status is not 200. Authentication errors such as
+        // an unapproved token commonly arrive as HTTP 403 with valid JSON.
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw LastFMError.invalidResponse
         }
         if let errorNumber = json["error"] as? NSNumber,
@@ -168,6 +177,9 @@ struct LastFMClient {
            let errorCode = Int(errorText),
            let message = json["message"] as? String {
             throw LastFMError.api(code: errorCode, message: message)
+        }
+        guard (200..<300).contains(httpStatus) else {
+            throw LastFMError.invalidResponse
         }
         return json
     }

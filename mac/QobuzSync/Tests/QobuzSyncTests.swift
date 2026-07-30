@@ -31,6 +31,17 @@ final class QobuzSyncTests: XCTestCase {
         XCTAssertFalse(LastFMError.api(code: 9, message: "Invalid session key").isAuthorizationPending)
     }
 
+    func testLastFMReadsJSONErrorFromHTTP403() {
+        let data = Data(#"{"error":14,"message":"Unauthorized Token"}"#.utf8)
+        XCTAssertThrowsError(try LastFMClient.decodeResponse(data: data, httpStatus: 403)) { error in
+            guard let lastFMError = error as? LastFMError else {
+                return XCTFail("Expected LastFMError, got \(error)")
+            }
+            XCTAssertTrue(lastFMError.isAuthorizationPending)
+            XCTAssertEqual(lastFMError.localizedDescription, "Last.fm error 14: Unauthorized Token")
+        }
+    }
+
     func testAFCInfoOutputIsMatchedToRequestedFiles() {
         let output = "\u{001B}[0;30m\u{001B}[47mafc:\u{001B}[m\u{001B}[1;33m\u{001B}[44m/\u{001B}[m > {\n"
             + "  \"st_size\": 74889,\n  \"st_ifmt\": \"S_IFREG\"\n}\n"
