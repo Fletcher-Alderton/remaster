@@ -45,9 +45,12 @@ final class SyncCoordinator: ObservableObject {
     private let apiKeyDefaultsKey = "lastFMAPIKey"
     private let usernameDefaultsKey = "lastFMUsername"
     private let pendingTokenDefaultsKey = "lastFMPendingToken"
+    private let pendingAPIKeyDefaultsKey = "lastFMPendingAPIKey"
+    private let pendingCreatedAtDefaultsKey = "lastFMPendingCreatedAt"
     private let sourceFolderDefaultsKey = "sourceFolderPath"
     private let autoSyncDefaultsKey = "autoSyncEnabled"
     private let sharedSecretAccount = "lastfm-shared-secret"
+    private let pendingSharedSecretAccount = "lastfm-pending-shared-secret"
     private let sessionKeyAccount = "lastfm-session-key"
 
     init() {
@@ -156,10 +159,20 @@ final class SyncCoordinator: ObservableObject {
             lastFMStatusMessage = LastFMError.missingCredentials.localizedDescription
             return
         }
+        guard LastFMClient.isValidCredentialValue(trimmedKey) else {
+            statusMessage = LastFMError.invalidAPIKey.localizedDescription
+            lastFMStatusMessage = statusMessage
+            return
+        }
+        guard LastFMClient.isValidCredentialValue(trimmedSecret) else {
+            statusMessage = LastFMError.invalidSharedSecret.localizedDescription
+            lastFMStatusMessage = statusMessage
+            return
+        }
         isLastFMWorking = true
-        defaults.set(trimmedKey, forKey: apiKeyDefaultsKey)
         do {
             try KeychainStore.set(trimmedSecret, for: sharedSecretAccount)
+            defaults.set(trimmedKey, forKey: apiKeyDefaultsKey)
         } catch {
             isLastFMWorking = false
             statusMessage = "Could not save the shared secret: \(error.localizedDescription)"
@@ -170,7 +183,10 @@ final class SyncCoordinator: ObservableObject {
         Task {
             do {
                 let token = try await lastFM.requestToken(apiKey: trimmedKey, sharedSecret: trimmedSecret)
+                try KeychainStore.set(trimmedSecret, for: pendingSharedSecretAccount)
                 defaults.set(token, forKey: pendingTokenDefaultsKey)
+                defaults.set(trimmedKey, forKey: pendingAPIKeyDefaultsKey)
+                defaults.set(Date(), forKey: pendingCreatedAtDefaultsKey)
                 if let url = lastFM.authorizationURL(apiKey: trimmedKey, token: token) {
                     _ = NSWorkspace.shared.open(url)
                 }
@@ -189,8 +205,9 @@ final class SyncCoordinator: ObservableObject {
     }
 
     func completeLastFMAuthorization() {
-        guard let token = defaults.string(forKey: pendingTokenDefaultsKey) else {
-            statusMessage = "Start Last.fm authorization first."
+        guard let pending = pendingLastFMAuthorization() else {
+            isWaitingForLastFMApproval = true
+            statusMessage = "This pending authorization is incomplete or expired. Click Start over."
             lastFMStatusMessage = statusMessage
             return
         }
@@ -198,17 +215,22 @@ final class SyncCoordinator: ObservableObject {
         Task {
             do {
                 let session = try await lastFM.requestSession(
-                    token: token,
-                    apiKey: apiKey,
-                    sharedSecret: sharedSecret
+                    token: pending.token,
+                    apiKey: pending.apiKey,
+                    sharedSecret: pending.sharedSecret
                 )
                 try finishLastFMAuthorization(session)
                 isLastFMWorking = false
                 await scrobblePending()
-            } catch let error as LastFMError where error.requiresManualApproval {
+            } catch let error as LastFMError where error.isAuthorizationPending {
                 isLastFMWorking = false
                 isWaitingForLastFMApproval = true
                 statusMessage = "Last.fm has not accepted this token yet. Approve the existing page, then click Finish once."
+                lastFMStatusMessage = statusMessage
+            } catch let error as LastFMError where error.isInvalidSignature {
+                isLastFMWorking = false
+                isWaitingForLastFMApproval = true
+                statusMessage = "Last.fm rejected the shared secret. Copy the full 32-character secret from API Applications, then click Start over."
                 lastFMStatusMessage = statusMessage
             } catch {
                 statusMessage = error.localizedDescription
@@ -219,9 +241,10 @@ final class SyncCoordinator: ObservableObject {
     }
 
     func openPendingLastFMApprovalPage() {
-        guard let token = defaults.string(forKey: pendingTokenDefaultsKey),
-              let url = lastFM.authorizationURL(apiKey: apiKey, token: token) else {
-            beginLastFMAuthorization()
+        guard let pending = pendingLastFMAuthorization(),
+              let url = lastFM.authorizationURL(apiKey: pending.apiKey, token: pending.token) else {
+            statusMessage = "This pending authorization is incomplete or expired. Click Start over."
+            lastFMStatusMessage = statusMessage
             return
         }
         _ = NSWorkspace.shared.open(url)
@@ -230,7 +253,7 @@ final class SyncCoordinator: ObservableObject {
     }
 
     func startOverLastFMAuthorization() {
-        defaults.removeObject(forKey: pendingTokenDefaultsKey)
+        clearPendingLastFMAuthorization()
         isWaitingForLastFMApproval = false
         beginLastFMAuthorization()
     }
@@ -238,7 +261,7 @@ final class SyncCoordinator: ObservableObject {
     func disconnectLastFM() {
         KeychainStore.remove(sessionKeyAccount)
         defaults.removeObject(forKey: usernameDefaultsKey)
-        defaults.removeObject(forKey: pendingTokenDefaultsKey)
+        clearPendingLastFMAuthorization()
         authorizedUsername = nil
         isWaitingForLastFMApproval = false
         statusMessage = "Last.fm disconnected. Your local play history was kept."
@@ -251,18 +274,40 @@ final class SyncCoordinator: ObservableObject {
 
     private func resumePendingLastFMAuthorization() {
         guard !hasLastFMSession,
-              defaults.string(forKey: pendingTokenDefaultsKey) != nil,
-              !apiKey.isEmpty,
-              !sharedSecret.isEmpty else { return }
+              defaults.string(forKey: pendingTokenDefaultsKey) != nil else { return }
         isWaitingForLastFMApproval = true
-        statusMessage = "Browser approval is pending. Approve the existing page, then click Finish."
+        statusMessage = pendingLastFMAuthorization() == nil
+            ? "This pending authorization is incomplete or expired. Click Start over."
+            : "Browser approval is pending. Approve the existing page, then click Finish."
         lastFMStatusMessage = statusMessage
+    }
+
+    private func pendingLastFMAuthorization() -> (
+        token: String,
+        apiKey: String,
+        sharedSecret: String
+    )? {
+        guard let token = defaults.string(forKey: pendingTokenDefaultsKey),
+              let pendingAPIKey = defaults.string(forKey: pendingAPIKeyDefaultsKey),
+              let pendingSecret = KeychainStore.string(for: pendingSharedSecretAccount),
+              let createdAt = defaults.object(forKey: pendingCreatedAtDefaultsKey) as? Date,
+              Date().timeIntervalSince(createdAt) < 60 * 60 else {
+            return nil
+        }
+        return (token, pendingAPIKey, pendingSecret)
+    }
+
+    private func clearPendingLastFMAuthorization() {
+        defaults.removeObject(forKey: pendingTokenDefaultsKey)
+        defaults.removeObject(forKey: pendingAPIKeyDefaultsKey)
+        defaults.removeObject(forKey: pendingCreatedAtDefaultsKey)
+        KeychainStore.remove(pendingSharedSecretAccount)
     }
 
     private func finishLastFMAuthorization(_ session: LastFMSession) throws {
         try KeychainStore.set(session.key, for: sessionKeyAccount)
         defaults.set(session.name, forKey: usernameDefaultsKey)
-        defaults.removeObject(forKey: pendingTokenDefaultsKey)
+        clearPendingLastFMAuthorization()
         authorizedUsername = session.name
         isWaitingForLastFMApproval = false
         statusMessage = "Last.fm connected as \(session.name)."

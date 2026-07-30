@@ -12,26 +12,37 @@ final class QobuzSyncTests: XCTestCase {
     }
 
     func testSignatureIsStableAndExcludesFormat() {
-        let parameters = [
-            "method": "auth.getToken",
-            "api_key": "key",
-            "format": "json"
-        ]
         XCTAssertEqual(
-            LastFMClient.signature(parameters: parameters, sharedSecret: "secret"),
             LastFMClient.signature(
-                parameters: ["api_key": "key", "method": "auth.getToken"],
+                parameters: ["api_key": "key", "method": "auth.getToken", "format": "json"],
                 sharedSecret: "secret"
-            )
+            ),
+            "b4705499705a550b07ca058a15bde9b0"
+        )
+        XCTAssertEqual(
+            LastFMClient.signature(
+                parameters: [
+                    "api_key": "key",
+                    "method": "auth.getSession",
+                    "token": "token"
+                ],
+                sharedSecret: "secret"
+            ),
+            "9ac306496295a8866c4a8673395540eb"
         )
     }
 
     func testLastFMAuthorizationPendingIsRecognized() {
         XCTAssertTrue(LastFMError.api(code: 14, message: "Unauthorized Token").isAuthorizationPending)
         XCTAssertFalse(LastFMError.api(code: 9, message: "Invalid session key").isAuthorizationPending)
-        XCTAssertTrue(LastFMError.api(code: 14, message: "Unauthorized Token").requiresManualApproval)
-        XCTAssertTrue(LastFMError.api(code: 13, message: "Invalid method signature supplied").requiresManualApproval)
-        XCTAssertFalse(LastFMError.api(code: 9, message: "Invalid session key").requiresManualApproval)
+        XCTAssertTrue(LastFMError.api(code: 13, message: "Invalid method signature supplied").isInvalidSignature)
+        XCTAssertFalse(LastFMError.api(code: 14, message: "Unauthorized Token").isInvalidSignature)
+    }
+
+    func testLastFMCredentialShapeValidation() {
+        XCTAssertTrue(LastFMClient.isValidCredentialValue("0123456789abcdef0123456789ABCDEF"))
+        XCTAssertFalse(LastFMClient.isValidCredentialValue("0123456789abcdef0123456789abcde"))
+        XCTAssertFalse(LastFMClient.isValidCredentialValue("0123456789abcdef0123456789abcdeg"))
     }
 
     func testLastFMReadsJSONErrorFromHTTP403() {

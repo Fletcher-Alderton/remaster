@@ -6,17 +6,16 @@ enum LastFMError: LocalizedError {
     case invalidResponse
     case api(code: Int, message: String)
     case missingCredentials
+    case invalidAPIKey
+    case invalidSharedSecret
 
     var isAuthorizationPending: Bool {
         if case .api(let code, _) = self { return code == 14 }
         return false
     }
 
-    var requiresManualApproval: Bool {
-        // Last.fm normally uses 14 for an unapproved desktop token, but it can
-        // also return 13 while the token/credential pair has not been accepted.
-        // Neither response should trigger another browser authorization.
-        if case .api(let code, _) = self { return code == 13 || code == 14 }
+    var isInvalidSignature: Bool {
+        if case .api(let code, _) = self { return code == 13 }
         return false
     }
 
@@ -25,12 +24,24 @@ enum LastFMError: LocalizedError {
         case .invalidResponse: return "Last.fm returned an unreadable response."
         case .api(let code, let message): return "Last.fm error \(code): \(message)"
         case .missingCredentials: return "Enter your Last.fm API key and shared secret first."
+        case .invalidAPIKey:
+            return "The Last.fm API key must be exactly 32 hexadecimal characters."
+        case .invalidSharedSecret:
+            return "The Last.fm shared secret must be exactly 32 hexadecimal characters. Copy the complete value from Last.fm API Applications."
         }
     }
 }
 
 struct LastFMClient {
     private let endpoint = URL(string: "https://ws.audioscrobbler.com/2.0/")!
+
+    static func isValidCredentialValue(_ value: String) -> Bool {
+        value.count == 32 && value.unicodeScalars.allSatisfy {
+            (48...57).contains($0.value)
+                || (65...70).contains($0.value)
+                || (97...102).contains($0.value)
+        }
+    }
 
     func requestToken(apiKey: String, sharedSecret: String) async throws -> String {
         let json = try await request(
@@ -137,6 +148,12 @@ struct LastFMClient {
         guard !apiKey.isEmpty, !sharedSecret.isEmpty else {
             throw LastFMError.missingCredentials
         }
+        guard Self.isValidCredentialValue(apiKey) else {
+            throw LastFMError.invalidAPIKey
+        }
+        guard Self.isValidCredentialValue(sharedSecret) else {
+            throw LastFMError.invalidSharedSecret
+        }
         var signedParameters = parameters
         signedParameters["method"] = method
         if let sessionKey {
@@ -150,9 +167,14 @@ struct LastFMClient {
 
         let request: URLRequest
         if usePOST {
-            var mutable = URLRequest(url: endpoint)
+            var mutable = URLRequest(
+                url: endpoint,
+                cachePolicy: .reloadIgnoringLocalCacheData,
+                timeoutInterval: 30
+            )
             mutable.httpMethod = "POST"
             mutable.setValue("application/x-www-form-urlencoded; charset=utf-8", forHTTPHeaderField: "Content-Type")
+            mutable.setValue("iPod-Qobuz-Sync/1.0", forHTTPHeaderField: "User-Agent")
             mutable.httpBody = Self.formEncoded(signedParameters).data(using: .utf8)
             request = mutable
         } else {
@@ -160,7 +182,13 @@ struct LastFMClient {
             components.queryItems = signedParameters
                 .sorted(by: { $0.key < $1.key })
                 .map { URLQueryItem(name: $0.key, value: $0.value) }
-            request = URLRequest(url: components.url!)
+            var mutable = URLRequest(
+                url: components.url!,
+                cachePolicy: .reloadIgnoringLocalCacheData,
+                timeoutInterval: 30
+            )
+            mutable.setValue("iPod-Qobuz-Sync/1.0", forHTTPHeaderField: "User-Agent")
+            request = mutable
         }
 
         let (data, response) = try await URLSession.shared.data(for: request)
