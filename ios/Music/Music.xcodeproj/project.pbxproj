@@ -9,7 +9,7 @@
 /* Begin PBXBuildFile section */
 
 
-		0D7D4986CE87C2C0171720D1 /* THIRD_PARTY_NOTICES.md in Resources */ = {isa = PBXBuildFile; fileRef = 03D9C1476B14FA080E084F2E /* THIRD_PARTY_NOTICES.md */; };
+
 		0DB63228442A2AF673006D88 /* ArtworkImagePipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = 59B07F515BB8F5D59DEDAFDC /* ArtworkImagePipeline.swift */; };
 		169FDE7709C76A110FBECA57 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = D03E99791EE3B92F35C067D0 /* Assets.xcassets */; };
 		16D178AECB1831E602026905 /* ScreenModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = E6EC5D2400DF4D0C46C9E366 /* ScreenModels.swift */; };
@@ -51,7 +51,7 @@
 
 
 		BEC7E5F561F3B2E94B84CB07 /* QobuzPreferences.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D50C41731CB76FA0CACAC66 /* QobuzPreferences.swift */; };
-		C1078329660256A0C0106542 /* QOBINE_GPL-3.0.txt in Resources */ = {isa = PBXBuildFile; fileRef = C2FDC0FF5803C050FE4C9EAB /* QOBINE_GPL-3.0.txt */; };
+
 		CFF1C2C9A3AD8713F34E4B6F /* QobuzCatalogViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = E4CE39949A60EF81A6C63138 /* QobuzCatalogViewController.swift */; };
 		D52C1DD62F42CD4BCB4B3D7B /* QobuzCatalogMapper.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4FBF7157397812E6BE130B0 /* QobuzCatalogMapper.swift */; };
 
@@ -87,7 +87,7 @@
 /* Begin PBXFileReference section */
 
 		03683C8219C07CF3D42E2B4C /* PlayerViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerViewController.swift; sourceTree = "<group>"; };
-		03D9C1476B14FA080E084F2E /* THIRD_PARTY_NOTICES.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = THIRD_PARTY_NOTICES.md; sourceTree = "<group>"; };
+
 
 
 
@@ -127,7 +127,7 @@
 
 
 		BEF928CC750AC319827D47AE /* SongSwipeActionCell.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SongSwipeActionCell.swift; sourceTree = "<group>"; };
-		C2FDC0FF5803C050FE4C9EAB /* QOBINE_GPL-3.0.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = "QOBINE_GPL-3.0.txt"; sourceTree = "<group>"; };
+
 		C57CBA3CCE7ECF32B5A90B44 /* QobuzStreamTestViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QobuzStreamTestViewController.swift; sourceTree = "<group>"; };
 		CB79EF8225F4771F4B762B46 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
 
@@ -187,16 +187,7 @@
 			sourceTree = "<group>";
 		};
 
-		52A82B1299ABFF84AA5FCA0F /* ipod-music-app-updated */ = {
-			isa = PBXGroup;
-			children = (
-				C2FDC0FF5803C050FE4C9EAB /* QOBINE_GPL-3.0.txt */,
-				03D9C1476B14FA080E084F2E /* THIRD_PARTY_NOTICES.md */,
-			);
-			name = "ipod-music-app-updated";
-			path = ../..;
-			sourceTree = "<group>";
-		};
+
 		62CF90E2F858567330FD55B8 /* Products */ = {
 			isa = PBXGroup;
 			children = (
@@ -262,7 +253,7 @@
 		E340EFC32A977D7F16C6A790 = {
 			isa = PBXGroup;
 			children = (
-				52A82B1299ABFF84AA5FCA0F /* ipod-music-app-updated */,
+
 				6F88A62CBF13EA42792D7F66 /* Resources */,
 				FD5A89AA5010758D116BF04C /* Sources */,
 				06D8A569689EBE572B46F89A /* Tests */,
@@ -398,8 +389,7 @@
 			files = (
 				169FDE7709C76A110FBECA57 /* Assets.xcassets in Resources */,
 				21D9C68E891CF1677645A814 /* LaunchScreen.storyboard in Resources */,
-				C1078329660256A0C0106542 /* QOBINE_GPL-3.0.txt in Resources */,
-				0D7D4986CE87C2C0171720D1 /* THIRD_PARTY_NOTICES.md in Resources */,
+
 
 			);
 			runOnlyForDeploymentPostprocessing = 0;

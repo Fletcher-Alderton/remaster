@@ -3,7 +3,7 @@ import Foundation
 import Security
 
 // Qobuz streaming protocol ported from SofusA/qobine (GPL-3.0).
-// Modified for this iOS app on 2026-07-11. See THIRD_PARTY_NOTICES.md.
+// Modified for this iOS app on 2026-07-11.
 struct QobuzCredentials: Codable {
     let userAuthToken: String
     let userID: Int64
