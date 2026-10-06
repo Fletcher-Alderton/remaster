@@ -2,10 +2,12 @@ import UIKit
 
 final class SettingsViewController: UIViewController, UITableViewDataSource, UITableViewDelegate, UITextFieldDelegate, UIGestureRecognizerDelegate {
     var onConfigurationChanged: (([SettingsTabItem]) -> Void)?
-    var onImport: (() -> Void)?
+
     var onLastFMChanged: ((String?) -> Void)?
     var onAppearanceChanged: ((AppearanceMode) -> Void)?
-    var onQobuzStreamTest: (() -> Void)?
+
+    var onQobuzAccountAction: (() -> Void)?
+    var onQualityChanged: ((QobuzStreamQuality) -> Void)?
     var onDismissSwipe: (() -> Void)?
 
     private var items: [SettingsTabItem]
@@ -17,10 +19,10 @@ final class SettingsViewController: UIViewController, UITableViewDataSource, UIT
     private let appearanceGroup = UIView()
     private let appearanceControl = UISegmentedControl(items: AppearanceMode.allCases.map { $0.title })
     private let tabsTable = UITableView(frame: .zero, style: .plain)
-    private let musicGroup = UIView()
-    private let importValueLabel = UILabel()
+
     private let qobuzGroup = UIView()
     private let qobuzTestButton = UIButton(type: .system)
+    private let qualityControl = UISegmentedControl(items: QobuzStreamQuality.allCases.map(\.title))
     private let scrobblingGroup = UIView()
     private let lastFMField = UITextField()
     private let lastFMButton = UIButton(type: .system)
@@ -55,9 +57,6 @@ final class SettingsViewController: UIViewController, UITableViewDataSource, UIT
         configureLastFM()
     }
 
-    func showImportResult(_ text: String) {
-        importValueLabel.text = text
-    }
 
     private func buildView() {
         view.accessibilityIdentifier = "settings"
@@ -101,32 +100,23 @@ final class SettingsViewController: UIViewController, UITableViewDataSource, UIT
         contentView.addSubview(tabsTable)
         tabsHeight = tabsTable.heightAnchor.constraint(equalToConstant: CGFloat(items.count) * 42)
 
-        let musicSection = sectionLabel("Music")
-        contentView.addSubview(musicSection)
-        configure(group: musicGroup)
-        contentView.addSubview(musicGroup)
-        let musicTitle = groupTitle("Import Music")
-        importValueLabel.translatesAutoresizingMaskIntoConstraints = false
-        importValueLabel.text = "Choose from Finder or iCloud Drive"
-        importValueLabel.textColor = DesignSystem.secondaryText
-        importValueLabel.font = DesignSystem.font(9)
-        importValueLabel.lineBreakMode = .byTruncatingMiddle
-        let importButton = actionButton(title: "Import")
-        importButton.addTarget(self, action: #selector(importTapped), for: .touchUpInside)
-        musicGroup.addSubview(musicTitle)
-        musicGroup.addSubview(importValueLabel)
-        musicGroup.addSubview(importButton)
 
-        let qobuzSection = sectionLabel("Streaming (Test)")
+        let qobuzSection = sectionLabel("Qobuz Account & Audio Quality")
         contentView.addSubview(qobuzSection)
         configure(group: qobuzGroup)
         contentView.addSubview(qobuzGroup)
         qobuzTestButton.translatesAutoresizingMaskIntoConstraints = false
-        qobuzTestButton.setTitle("Open Qobuz Stream Test", for: .normal)
+        qobuzTestButton.setTitle("Account: \(QobuzCredentialStore.shared.load() == nil ? "Not signed in" : "Manage")", for: .normal)
         qobuzTestButton.setTitleColor(DesignSystem.accent, for: .normal)
         qobuzTestButton.titleLabel?.font = DesignSystem.font(10, weight: .semibold)
         qobuzTestButton.addTarget(self, action: #selector(qobuzTestTapped), for: .touchUpInside)
         qobuzGroup.addSubview(qobuzTestButton)
+        qualityControl.translatesAutoresizingMaskIntoConstraints = false
+        qualityControl.selectedSegmentIndex = QobuzStreamQuality.allCases.firstIndex(of: QobuzPreferences.quality) ?? 1
+        qualityControl.tintColor = DesignSystem.accent
+        qualityControl.accessibilityIdentifier = "settings.qobuzQuality"
+        qualityControl.addTarget(self, action: #selector(qualityChanged), for: .valueChanged)
+        qobuzGroup.addSubview(qualityControl)
 
         let scrobblingSection = sectionLabel("Scrobbling")
         contentView.addSubview(scrobblingSection)
@@ -175,28 +165,18 @@ final class SettingsViewController: UIViewController, UITableViewDataSource, UIT
             tabsTable.topAnchor.constraint(equalTo: tabsSection.bottomAnchor, constant: 6),
             tabsHeight,
 
-            musicSection.leadingAnchor.constraint(equalTo: tabsSection.leadingAnchor),
-            musicSection.topAnchor.constraint(equalTo: tabsTable.bottomAnchor, constant: 18),
-            musicGroup.leadingAnchor.constraint(equalTo: tabsTable.leadingAnchor),
-            musicGroup.trailingAnchor.constraint(equalTo: tabsTable.trailingAnchor),
-            musicGroup.topAnchor.constraint(equalTo: musicSection.bottomAnchor, constant: 6),
-            musicGroup.heightAnchor.constraint(equalToConstant: 54),
-            musicTitle.leadingAnchor.constraint(equalTo: musicGroup.leadingAnchor, constant: 10),
-            musicTitle.topAnchor.constraint(equalTo: musicGroup.topAnchor, constant: 9),
-            importValueLabel.leadingAnchor.constraint(equalTo: musicTitle.leadingAnchor),
-            importValueLabel.trailingAnchor.constraint(equalTo: importButton.leadingAnchor, constant: -8),
-            importValueLabel.topAnchor.constraint(equalTo: musicTitle.bottomAnchor, constant: 3),
-            importButton.trailingAnchor.constraint(equalTo: musicGroup.trailingAnchor, constant: -9),
-            importButton.centerYAnchor.constraint(equalTo: musicGroup.centerYAnchor),
 
             qobuzSection.leadingAnchor.constraint(equalTo: tabsSection.leadingAnchor),
-            qobuzSection.topAnchor.constraint(equalTo: musicGroup.bottomAnchor, constant: 18),
+            qobuzSection.topAnchor.constraint(equalTo: tabsTable.bottomAnchor, constant: 18),
             qobuzGroup.leadingAnchor.constraint(equalTo: tabsTable.leadingAnchor),
             qobuzGroup.trailingAnchor.constraint(equalTo: tabsTable.trailingAnchor),
             qobuzGroup.topAnchor.constraint(equalTo: qobuzSection.bottomAnchor, constant: 6),
-            qobuzGroup.heightAnchor.constraint(equalToConstant: 48),
+            qobuzGroup.heightAnchor.constraint(equalToConstant: 80),
             qobuzTestButton.leadingAnchor.constraint(equalTo: qobuzGroup.leadingAnchor, constant: 10),
-            qobuzTestButton.centerYAnchor.constraint(equalTo: qobuzGroup.centerYAnchor),
+            qobuzTestButton.topAnchor.constraint(equalTo: qobuzGroup.topAnchor, constant: 7),
+            qualityControl.leadingAnchor.constraint(equalTo: qobuzGroup.leadingAnchor, constant: 8),
+            qualityControl.trailingAnchor.constraint(equalTo: qobuzGroup.trailingAnchor, constant: -8),
+            qualityControl.bottomAnchor.constraint(equalTo: qobuzGroup.bottomAnchor, constant: -7),
 
             scrobblingSection.leadingAnchor.constraint(equalTo: tabsSection.leadingAnchor),
             scrobblingSection.topAnchor.constraint(equalTo: qobuzGroup.bottomAnchor, constant: 18),
@@ -233,14 +213,6 @@ final class SettingsViewController: UIViewController, UITableViewDataSource, UIT
         return label
     }
 
-    private func groupTitle(_ title: String) -> UILabel {
-        let label = UILabel()
-        label.translatesAutoresizingMaskIntoConstraints = false
-        label.text = title
-        label.font = DesignSystem.font(12)
-        label.textColor = DesignSystem.primaryText
-        return label
-    }
 
     private func configure(group: UIView) {
         group.translatesAutoresizingMaskIntoConstraints = false
@@ -250,12 +222,6 @@ final class SettingsViewController: UIViewController, UITableViewDataSource, UIT
         group.layer.borderColor = DesignSystem.separator.cgColor
     }
 
-    private func actionButton(title: String) -> UIButton {
-        let button = UIButton(type: .system)
-        button.translatesAutoresizingMaskIntoConstraints = false
-        style(actionButton: button, title: title)
-        return button
-    }
 
     private func style(actionButton: UIButton, title: String) {
         actionButton.setTitle(title, for: .normal)
@@ -296,7 +262,7 @@ final class SettingsViewController: UIViewController, UITableViewDataSource, UIT
             tabsTable.reloadRows(at: [IndexPath(row: index, section: 0)], with: .none)
             return
         }
-        if enabled && enabledCount >= 6 {
+        if enabled && enabledCount >= TabConfiguration.maximumTabs {
             tabsTable.reloadRows(at: [IndexPath(row: index, section: 0)], with: .none)
             return
         }
@@ -358,7 +324,6 @@ final class SettingsViewController: UIViewController, UITableViewDataSource, UIT
         notifyConfiguration()
     }
 
-    @objc private func importTapped() { onImport?() }
 
     @objc private func appearanceChanged() {
         guard AppearanceMode.allCases.indices.contains(appearanceControl.selectedSegmentIndex) else { return }
@@ -366,7 +331,12 @@ final class SettingsViewController: UIViewController, UITableViewDataSource, UIT
         onAppearanceChanged?(appearanceMode)
     }
 
-    @objc private func qobuzTestTapped() { onQobuzStreamTest?() }
+    @objc private func qobuzTestTapped() { onQobuzAccountAction?() }
+
+    @objc private func qualityChanged() {
+        guard QobuzStreamQuality.allCases.indices.contains(qualityControl.selectedSegmentIndex) else { return }
+        onQualityChanged?(QobuzStreamQuality.allCases[qualityControl.selectedSegmentIndex])
+    }
 
     @objc private func lastFMTapped() {
         if lastFMUsername != nil {

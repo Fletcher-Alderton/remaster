@@ -3,11 +3,12 @@ import UIKit
 
 /// Standalone live-stream spike used to validate Qobuz stream resolution and playback.
 final class QobuzStreamTestViewController: UIViewController, UITextFieldDelegate, UITableViewDataSource, UITableViewDelegate {
-    private let credentialsStore = QobuzCredentialStore()
+    var onPlayInApp: ((QobuzSearchTrack, QobuzStreamQuality) -> Void)?
+    private let credentialsStore = QobuzCredentialStore.shared
     private let streamPlayer = QobuzStreamPlayer()
     private var authSession: SFAuthenticationSession?
     private var playbackStatusMessage: String?
-
+    private let cacheLock = NSLock()
     private let accountButton = UIButton(type: .system)
     private let trackIDField = UITextField()
     private let searchField = UITextField()
@@ -16,13 +17,15 @@ final class QobuzStreamTestViewController: UIViewController, UITextFieldDelegate
     private let qualityControl = UISegmentedControl(items: ["MP3", "CD", "96 kHz", "192 kHz"])
     private let qualityDetailLabel = UILabel()
     private let statusLabel = UILabel()
-    private let resolveButton = UIButton(type: .system)
+    private let playerButton = UIButton(type: .system)
+    private let playInAppButton = UIButton(type: .system)
     private let playButton = UIButton(type: .system)
     private let seekSlider = UISlider()
     private let timeLabel = UILabel()
     private var isResolving = false
     private var searchResults: [QobuzSearchTrack] = []
     private var selectedQuality: QobuzStreamQuality = .mp3
+    private var selectedSearchTrack: QobuzSearchTrack?
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -147,11 +150,18 @@ final class QobuzStreamTestViewController: UIViewController, UITextFieldDelegate
         trackIDField.translatesAutoresizingMaskIntoConstraints = false
         contentView.addSubview(trackIDField)
 
-        resolveButton.setTitle("Resolve & Play", for: .normal)
-        resolveButton.titleLabel?.font = DesignSystem.font(12, weight: .semibold)
-        resolveButton.addTarget(self, action: #selector(resolveTapped), for: .touchUpInside)
-        resolveButton.translatesAutoresizingMaskIntoConstraints = false
-        contentView.addSubview(resolveButton)
+        playInAppButton.setTitle("Play in App", for: .normal)
+        playInAppButton.titleLabel?.font = DesignSystem.font(12, weight: .semibold)
+        playInAppButton.addTarget(self, action: #selector(playInAppTapped), for: .touchUpInside)
+        playInAppButton.accessibilityIdentifier = "qobuz.playInApp"
+        playInAppButton.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(playInAppButton)
+
+        playerButton.setTitle("Resolve & Play Test", for: .normal)
+        playerButton.titleLabel?.font = DesignSystem.font(12, weight: .semibold)
+        playerButton.addTarget(self, action: #selector(resolveTapped), for: .touchUpInside)
+        playerButton.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(playerButton)
 
         playButton.setTitle("Pause", for: .normal)
         playButton.addTarget(self, action: #selector(togglePlayback), for: .touchUpInside)
@@ -216,10 +226,12 @@ final class QobuzStreamTestViewController: UIViewController, UITextFieldDelegate
             trackIDField.trailingAnchor.constraint(equalTo: searchButton.trailingAnchor),
             trackIDField.topAnchor.constraint(equalTo: qualityDetailLabel.bottomAnchor, constant: 8),
             trackIDField.heightAnchor.constraint(equalToConstant: 40),
-            resolveButton.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            resolveButton.topAnchor.constraint(equalTo: trackIDField.bottomAnchor, constant: 5),
+            playerButton.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            playerButton.topAnchor.constraint(equalTo: trackIDField.bottomAnchor, constant: 5),
+            playInAppButton.leadingAnchor.constraint(equalTo: playerButton.trailingAnchor, constant: 12),
+            playInAppButton.centerYAnchor.constraint(equalTo: playerButton.centerYAnchor),
             playButton.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            playButton.topAnchor.constraint(equalTo: resolveButton.bottomAnchor, constant: 8),
+            playButton.topAnchor.constraint(equalTo: playerButton.bottomAnchor, constant: 8),
             seekSlider.leadingAnchor.constraint(equalTo: title.leadingAnchor),
             seekSlider.trailingAnchor.constraint(equalTo: searchButton.trailingAnchor),
             seekSlider.topAnchor.constraint(equalTo: playButton.bottomAnchor, constant: 2),
@@ -231,7 +243,6 @@ final class QobuzStreamTestViewController: UIViewController, UITextFieldDelegate
             statusLabel.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -18)
         ])
     }
-
 
     private func updateAccountButton() {
         accountButton.setTitle(credentialsStore.load() == nil ? "Sign In to Qobuz" : "Sign Out of Qobuz", for: .normal)
@@ -325,6 +336,7 @@ final class QobuzStreamTestViewController: UIViewController, UITextFieldDelegate
                 case .success(let tracks):
                     self.searchResults = tracks
                     self.resultsTable.reloadData()
+                    self.loadArtwork(for: tracks)
                     self.statusLabel.textColor = DesignSystem.secondaryText
                     self.statusLabel.text = tracks.isEmpty ? "No matching songs found." : "Tap a song to select its track ID."
                 }
@@ -353,16 +365,75 @@ final class QobuzStreamTestViewController: UIViewController, UITextFieldDelegate
         cell.detailTextLabel?.font = DesignSystem.font(9)
         cell.detailTextLabel?.textColor = DesignSystem.secondaryText
         cell.backgroundColor = DesignSystem.pageBackground
+        if let imageURL = track.album?.imageURL,
+           let image = ArtworkImagePipeline.shared.cachedImage(for: imageURL.absoluteString) {
+            cell.imageView?.image = image
+        } else {
+            cell.imageView?.image = nil
+        }
         cell.accessibilityIdentifier = "qobuz.searchResult.\(track.id)"
+        cell.accessoryType = .disclosureIndicator
+        if let imageURL = track.album?.imageURL {
+            ArtworkImagePipeline.shared.image(forRemoteURL: imageURL, maximumPixelSize: 80) { [weak tableView, weak cell] image in
+                guard let tableView = tableView, let cell = cell,
+                      tableView.indexPath(for: cell) == indexPath else { return }
+                cell.imageView?.image = image
+                cell.setNeedsLayout()
+            }
+        }
         return cell
     }
 
     func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
         tableView.deselectRow(at: indexPath, animated: true)
         let track = searchResults[indexPath.row]
+        selectedSearchTrack = track
         trackIDField.text = String(track.id)
         statusLabel.textColor = DesignSystem.secondaryText
-        statusLabel.text = "Selected \(track.title) — \(selectedQuality.title). Tap Resolve & Play."
+        statusLabel.text = "Selected \(track.title) — \(selectedQuality.title). Tap Play here, or Play in App."
+    }
+
+    private func loadArtwork(for tracks: [QobuzSearchTrack]) {
+        let artworkURLs = Set(tracks.compactMap { $0.album?.imageURL })
+        for url in artworkURLs {
+            ArtworkImagePipeline.shared.image(forRemoteURL: url, maximumPixelSize: 320) { [weak self] image in
+                guard let self = self, let image = image else { return }
+                self.cacheLock.lock()
+                let stillRelevant = self.selectedSearchTrack?.album?.imageURL == url
+                self.cacheLock.unlock()
+                self.refreshVisibleSearchArtwork(url: url, image: image)
+                if stillRelevant {
+                    self.refreshSelectedTrackArtwork(image, url: url)
+                }
+            }
+        }
+    }
+
+    private func refreshSelectedTrackArtwork(_ image: UIImage, url: URL) {
+        cacheLock.lock()
+        let selected = selectedSearchTrack
+        cacheLock.unlock()
+        guard selected?.album?.imageURL == url else { return }
+        ArtworkImagePipeline.shared.cache(image, for: url.absoluteString)
+    }
+
+    private func refreshVisibleSearchArtwork(url: URL, image: UIImage) {
+        for indexPath in resultsTable.indexPathsForVisibleRows ?? [] {
+            guard searchResults.indices.contains(indexPath.row),
+                  searchResults[indexPath.row].album?.imageURL == url,
+                  let cell = resultsTable.cellForRow(at: indexPath) else { continue }
+            cell.imageView?.image = image
+            cell.setNeedsLayout()
+        }
+    }
+
+    @objc private func playInAppTapped() {
+        guard let track = selectedSearchTrack else {
+            statusLabel.textColor = .systemRed
+            statusLabel.text = "Search for and select a Qobuz track first."
+            return
+        }
+        onPlayInApp?(track, selectedQuality)
     }
 
     @objc private func resolveTapped() {
@@ -377,14 +448,17 @@ final class QobuzStreamTestViewController: UIViewController, UITextFieldDelegate
             return
         }
         isResolving = true
-        resolveButton.isEnabled = false
+        playerButton.isEnabled = false
+        playbackStatusMessage = nil
+        let requestedQuality = selectedQuality
         statusLabel.textColor = DesignSystem.secondaryText
         QobuzStreamingClient(credentials: credentials).requestStreamURL(
             trackID: trackID,
-            quality: selectedQuality,
+            quality: requestedQuality,
             progress: { [weak self] message in
+                guard let self = self else { return }
                 DispatchQueue.main.async {
-                    guard let self = self, self.isResolving else { return }
+                    guard self.isResolving else { return }
                     self.statusLabel.text = message
                 }
             }
@@ -392,13 +466,26 @@ final class QobuzStreamTestViewController: UIViewController, UITextFieldDelegate
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 self.isResolving = false
-                self.resolveButton.isEnabled = true
+                self.playerButton.isEnabled = true
                 switch result {
                 case .failure(let error): self.showError(error)
-                case .success(let stream) where stream.formatID != self.selectedQuality.rawValue:
-                    self.showError(QobuzStreamingError.api("Qobuz returned format \(stream.formatID), not \(self.selectedQuality.title)."))
                 case .success(let stream):
-                    self.statusLabel.text = "Starting \(self.selectedQuality.title) stream (\(stream.bitDepth)-bit / \(Int(stream.samplingRate * 1000)) Hz)…"
+                    guard let actualQuality = Self.quality(forFormatID: stream.formatID) else {
+                        self.showError(QobuzStreamingError.api("Qobuz returned an unknown stream format ID (\(stream.formatID)); playback was not started."))
+                        return
+                    }
+                    let actualRateHz = Int(stream.samplingRate * 1000)
+                    let formatDescription = "Actual stream: \(actualQuality.title) (format \(stream.formatID)), \(stream.bitDepth)-bit / \(actualRateHz) Hz."
+                    if actualQuality != requestedQuality {
+                        if actualQuality.rawValue < requestedQuality.rawValue {
+                            self.playbackStatusMessage = "Downgrade: requested \(requestedQuality.title), but Qobuz provided \(actualQuality.title). Playing the returned stream. \(formatDescription)"
+                        } else {
+                            self.playbackStatusMessage = "Requested \(requestedQuality.title), but Qobuz provided \(actualQuality.title). Playing the returned stream. \(formatDescription)"
+                        }
+                    } else {
+                        self.playbackStatusMessage = "Playing requested \(requestedQuality.title). \(formatDescription)"
+                    }
+                    self.statusLabel.text = self.playbackStatusMessage
                     self.startPlayback(url: stream.url)
                 }
             }
@@ -427,6 +514,16 @@ final class QobuzStreamTestViewController: UIViewController, UITextFieldDelegate
     func textFieldShouldReturn(_ textField: UITextField) -> Bool {
         if textField === searchField { searchTapped() }
         return true
+    }
+
+    private static func quality(forFormatID formatID: Int) -> QobuzStreamQuality? {
+        switch formatID {
+        case QobuzStreamQuality.mp3.rawValue: return .mp3
+        case QobuzStreamQuality.cd.rawValue: return .cd
+        case QobuzStreamQuality.hiRes96.rawValue: return .hiRes96
+        case QobuzStreamQuality.hiRes192.rawValue: return .hiRes192
+        default: return nil
+        }
     }
 
     private static func timeString(_ time: Double) -> String {

@@ -36,20 +36,80 @@ enum QobuzStreamQuality: Int, CaseIterable {
 
 struct QobuzSearchTrack: Codable {
     struct Performer: Codable {
+        let id: String?
         let name: String?
+
+        enum CodingKeys: String, CodingKey { case id, name }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            name = try container.decodeIfPresent(String.self, forKey: .name)
+            if let value = try? container.decode(String.self, forKey: .id) { id = value }
+            else if let value = try? container.decode(Int64.self, forKey: .id) { id = String(value) }
+            else { id = nil }
+        }
+    }
+
+    struct Image: Codable {
+        let small: String?
+        let thumbnail: String?
+        let large: String?
+        let extraLarge: String?
+
+        enum CodingKeys: String, CodingKey {
+            case small
+            case thumbnail
+            case large
+            case extraLarge = "extaLarge"
+        }
     }
 
     struct Album: Codable {
+        let id: String?
         let title: String?
+        let image: Image?
+
+        enum CodingKeys: String, CodingKey { case id, title, image }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            title = try container.decodeIfPresent(String.self, forKey: .title)
+            image = try container.decodeIfPresent(Image.self, forKey: .image)
+            if let value = try? container.decode(String.self, forKey: .id) { id = value }
+            else if let value = try? container.decode(Int64.self, forKey: .id) { id = String(value) }
+            else { id = nil }
+        }
+
+        var imageURL: URL? {
+            [image?.extraLarge, image?.large, image?.thumbnail, image?.small]
+                .compactMap { $0 }
+                .compactMap(URL.init(string:))
+                .first { $0.scheme?.lowercased() == "https" }
+        }
     }
 
-    let id: Int64
-    let title: String
-    let duration: Int?
-    let performer: Performer?
-    let album: Album?
+        let id: Int64
+        let title: String
+        let duration: Int?
+        let performer: Performer?
+        let album: Album?
+        let albumID: String?
 
-    var subtitle: String {
+        enum CodingKeys: String, CodingKey { case id, title, duration, performer, album, albumID = "album_id" }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            id = try container.decode(Int64.self, forKey: .id)
+            title = try container.decode(String.self, forKey: .title)
+            duration = try container.decodeIfPresent(Int.self, forKey: .duration)
+            performer = try container.decodeIfPresent(Performer.self, forKey: .performer)
+            album = try container.decodeIfPresent(Album.self, forKey: .album)
+            if let stringID = try? container.decode(String.self, forKey: .albumID) { albumID = stringID }
+            else if let numericID = try? container.decode(Int64.self, forKey: .albumID) { albumID = String(numericID) }
+            else { albumID = nil }
+        }
+
+        var subtitle: String {
         [performer?.name, album?.title].compactMap { $0 }.joined(separator: " • ")
     }
 }
@@ -80,13 +140,16 @@ struct QobuzTrackURL: Decodable {
 
 enum QobuzStreamingError: LocalizedError {
     case invalidResponse
+    case notAuthenticated
     case appIDNotFound
     case secretsNotFound
     case resolutionTimedOut
     case secretProbesFailed(count: Int, lastError: String)
     case unauthorized
+    case signingRejected
     case api(String)
     case invalidTrackID
+    case invalidQobuzTrackID
     case emptySearchQuery
     case invalidCallback
     case keychain(OSStatus)
@@ -94,14 +157,17 @@ enum QobuzStreamingError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .invalidResponse: return "Qobuz returned an invalid response."
+        case .notAuthenticated: return "Sign in to Qobuz before queueing music."
         case .appIDNotFound: return "Could not find the Qobuz web player app ID."
         case .secretsNotFound: return "Could not find the active Qobuz signing secret."
         case .resolutionTimedOut: return "Qobuz stream resolution timed out. Check your connection and try again."
         case .secretProbesFailed(let count, let lastError):
             return "None of the \(count) Qobuz signing secrets worked. Last probe error: \(lastError)"
         case .unauthorized: return "Qobuz rejected the sign-in or stream request."
+        case .signingRejected: return "Qobuz rejected the stream request signature."
         case .api(let message): return message
         case .invalidTrackID: return "Enter a numeric Qobuz track ID."
+        case .invalidQobuzTrackID: return "The selected Qobuz track has an invalid ID."
         case .emptySearchQuery: return "Enter a song title or artist to search Qobuz."
         case .invalidCallback: return "Qobuz sign-in did not return an authorization code."
         case .keychain(let status): return "Could not securely store Qobuz credentials (Keychain error \(status))."
@@ -111,6 +177,8 @@ enum QobuzStreamingError: LocalizedError {
 
 /// Stores the OAuth token in the system Keychain rather than app preferences.
 final class QobuzCredentialStore {
+    static let shared = QobuzCredentialStore()
+
     private let service = Bundle.main.bundleIdentifier ?? "com.fletcher.MusicPrototype"
     private let account = "qobuz.credentials"
     #if targetEnvironment(simulator)
@@ -119,12 +187,10 @@ final class QobuzCredentialStore {
     private(set) var isSessionOnly = false
 
     func load() -> QobuzCredentials? {
-        let service = Bundle.main.bundleIdentifier ?? "com.fletcher.MusicPrototype"
-        let account = "qobuz.credentials"
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: Bundle.main.bundleIdentifier ?? "com.fletcher.MusicPrototype",
-            kSecAttrAccount as String: "qobuz.credentials",
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne
         ]
@@ -142,8 +208,6 @@ final class QobuzCredentialStore {
 
     func save(_ credentials: QobuzCredentials) throws {
         let data = try JSONEncoder().encode(credentials)
-        let service = Bundle.main.bundleIdentifier ?? "com.fletcher.MusicPrototype"
-        let account = "qobuz.credentials"
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -208,20 +272,53 @@ private struct QobuzCachedSearch: Codable {
 }
 
 private enum QobuzSearchCache {
-    private static let keyPrefix = "qobuz.search.v1."
+    private static let keyPrefix = "qobuz.search.v2."
+    private static let legacyKeyPrefix = "qobuz.search.v1."
     private static let expirationInterval: TimeInterval = 15 * 60
+    private static let maximumEntries = 100
 
-    private static func cacheKey(query: String) -> String {
+    private static func cacheKey(query: String, accountID: Int64) -> String {
         let bytes = Array(query.lowercased().utf8)
         var digest = [UInt8](repeating: 0, count: Int(CC_MD5_DIGEST_LENGTH))
         _ = CC_MD5(bytes, CC_LONG(bytes.count), &digest)
-        return keyPrefix + digest.map { String(format: "%02x", $0) }.joined()
+        let queryHash = digest.map { String(format: "%02x", $0) }.joined()
+        return keyPrefix + String(accountID) + "." + queryHash
     }
 
-    static func load(query: String) -> [QobuzSearchTrack]? {
-        let key = cacheKey(query: query)
+    private static func removeLegacyEntries() {
+        for key in UserDefaults.standard.dictionaryRepresentation().keys where key.hasPrefix(legacyKeyPrefix) {
+            UserDefaults.standard.removeObject(forKey: key)
+        }
+    }
+
+    private static func pruneEntries(excluding keyToKeep: String? = nil) {
+        let defaults = UserDefaults.standard
+        let entries = defaults.dictionaryRepresentation().keys.filter { $0.hasPrefix(keyPrefix) }.compactMap { key -> (String, Date)? in
+            guard let data = defaults.data(forKey: key),
+                  let cached = try? JSONDecoder().decode(QobuzCachedSearch.self, from: data) else {
+                defaults.removeObject(forKey: key)
+                return nil
+            }
+            let age = Date().timeIntervalSince(cached.cachedAt)
+            guard age >= 0, age < expirationInterval else {
+                defaults.removeObject(forKey: key)
+                return nil
+            }
+            return (key, cached.cachedAt)
+        }
+        let candidates = entries.filter { $0.0 != keyToKeep }.sorted { $0.1 < $1.1 }
+        let excess = max(0, entries.count - maximumEntries)
+        for (key, _) in candidates.prefix(excess) {
+            defaults.removeObject(forKey: key)
+        }
+    }
+
+    static func load(query: String, accountID: Int64) -> [QobuzSearchTrack]? {
+        removeLegacyEntries()
+        let key = cacheKey(query: query, accountID: accountID)
         guard let data = UserDefaults.standard.data(forKey: key),
               let cached = try? JSONDecoder().decode(QobuzCachedSearch.self, from: data),
+              Date().timeIntervalSince(cached.cachedAt) >= 0,
               Date().timeIntervalSince(cached.cachedAt) < expirationInterval else {
             UserDefaults.standard.removeObject(forKey: key)
             return nil
@@ -229,10 +326,12 @@ private enum QobuzSearchCache {
         return cached.tracks
     }
 
-    static func save(_ tracks: [QobuzSearchTrack], query: String) {
-        let key = cacheKey(query: query)
+    static func save(_ tracks: [QobuzSearchTrack], query: String, accountID: Int64) {
+        removeLegacyEntries()
+        let key = cacheKey(query: query, accountID: accountID)
         guard let data = try? JSONEncoder().encode(QobuzCachedSearch(tracks: tracks, cachedAt: Date())) else { return }
         UserDefaults.standard.set(data, forKey: key)
+        pruneEntries(excluding: key)
     }
 }
 
@@ -322,7 +421,16 @@ private final class QobuzResolution {
 }
 
 /// Minimal Swift port of Qobine's web-player secret discovery and signed file-URL flow.
-final class QobuzStreamingClient {
+protocol QobuzStreamResolving {
+    func requestStreamURL(
+        trackID: Int64,
+        quality: QobuzStreamQuality,
+        progress: @escaping (String) -> Void,
+        completion: @escaping (Result<QobuzTrackURL, Error>) -> Void
+    )
+}
+
+final class QobuzStreamingClient: QobuzStreamResolving {
     private static let apiBase = URL(string: "https://www.qobuz.com/api.json/0.2/")!
     private static let playBase = URL(string: "https://play.qobuz.com")!
     private static let oauthPrivateKey = "6lz8C03UDIC7"
@@ -388,7 +496,7 @@ final class QobuzStreamingClient {
             completion(.failure(QobuzStreamingError.emptySearchQuery))
             return
         }
-        if let cachedTracks = QobuzSearchCache.load(query: trimmedQuery) {
+        if let cachedTracks = QobuzSearchCache.load(query: trimmedQuery, accountID: credentials.userID) {
             completion(.success(cachedTracks))
             return
         }
@@ -417,7 +525,7 @@ final class QobuzStreamingClient {
                     }
                     do {
                         let search = try JSONDecoder().decode(QobuzTrackSearchResponse.self, from: data)
-                        QobuzSearchCache.save(search.tracks.items, query: trimmedQuery)
+                        QobuzSearchCache.save(search.tracks.items, query: trimmedQuery, accountID: self.credentials.userID)
                         completion(.success(search.tracks.items))
                     } catch {
                         completion(.failure(error))
@@ -425,6 +533,144 @@ final class QobuzStreamingClient {
                 }.resume()
             }
         }
+    }
+
+    func searchCatalog(query: String, completion: @escaping (Result<QobuzCatalogSearchResponse, Error>) -> Void) {
+        let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else {
+            completion(.failure(QobuzStreamingError.emptySearchQuery))
+            return
+        }
+        discoverWebPlayer { result in
+            switch result {
+            case .failure(let error): completion(.failure(error))
+            case .success(let playerInfo):
+                let group = DispatchGroup()
+                let lock = NSLock()
+                var albums: QobuzCatalogPage<QobuzCatalogAlbum>?
+                var artists: QobuzCatalogPage<QobuzCatalogArtist>?
+                var tracks: QobuzTrackSearchResponse.Tracks?
+                var firstError: Error?
+                let requests: [(String, (Data) throws -> Void)] = [
+                    ("album/search", { data in albums = try JSONDecoder().decode(QobuzCatalogSearchResponse.self, from: data).albums }),
+                    ("artist/search", { data in artists = try JSONDecoder().decode(QobuzCatalogSearchResponse.self, from: data).artists }),
+                    ("track/search", { data in tracks = try JSONDecoder().decode(QobuzTrackSearchResponse.self, from: data).tracks })
+                ]
+                for (path, decode) in requests {
+                    group.enter()
+                    self.performCatalogRequest(path: path, queryItems: [
+                        URLQueryItem(name: "query", value: query),
+                        URLQueryItem(name: "limit", value: "25")
+                    ], appID: playerInfo.appID) { result in
+                        lock.lock()
+                        defer { lock.unlock() }
+                        switch result {
+                        case .success(let data):
+                            do { try decode(data) } catch { if firstError == nil { firstError = error } }
+                        case .failure(let error): if firstError == nil { firstError = error }
+                        }
+                        group.leave()
+                    }
+                }
+                group.notify(queue: .global()) {
+                    lock.lock()
+                    let response = QobuzCatalogSearchResponse(albums: albums, artists: artists, tracks: tracks.map { QobuzCatalogPage(items: $0.items, total: nil) })
+                    let succeeded = [albums != nil, artists != nil, tracks != nil].contains(true)
+                    let error = succeeded ? nil : firstError
+                    lock.unlock()
+                    if let error = error { completion(.failure(error)) }
+                    else { completion(.success(response)) }
+                }
+            }
+        }
+    }
+
+    func featuredCatalog(completion: @escaping (Result<QobuzCatalogFeaturedResponse, Error>) -> Void) {
+        discoverWebPlayer { result in
+            switch result {
+            case .failure(let error): completion(.failure(error))
+            case .success(let playerInfo):
+                self.performCatalogRequest(path: "album/getFeatured", queryItems: [
+                    URLQueryItem(name: "type", value: "new-releases"),
+                    URLQueryItem(name: "limit", value: "25")
+                ], appID: playerInfo.appID) { albumResult in
+                    switch albumResult {
+                    case .failure(let error): completion(.failure(error))
+                    case .success(let albumData):
+                        do {
+                            let albumPage = try JSONDecoder().decode(QobuzCatalogFeaturedResponse.self, from: albumData).albums
+                            self.performCatalogRequest(path: "artist/getFeatured", queryItems: [
+                                URLQueryItem(name: "limit", value: "25")
+                            ], appID: playerInfo.appID) { artistResult in
+                                completion(artistResult.flatMap { data in
+                                    Result {
+                                        let artists = try JSONDecoder().decode(QobuzCatalogFeaturedResponse.self, from: data).artists
+                                        return QobuzCatalogFeaturedResponse(albums: albumPage, artists: artists)
+                                    }
+                                })
+                            }
+                        } catch { completion(.failure(error)) }
+                    }
+                }
+            }
+        }
+    }
+
+    func album(id: String, completion: @escaping (Result<QobuzCatalogAlbum, Error>) -> Void) {
+        discoverWebPlayer { result in
+            switch result {
+            case .failure(let error): completion(.failure(error))
+            case .success(let playerInfo):
+                self.performCatalogRequest(path: "album/get", queryItems: [
+                    URLQueryItem(name: "album_id", value: id),
+                    URLQueryItem(name: "limit", value: "500")
+                ], appID: playerInfo.appID) { result in
+                    completion(result.flatMap { data in Result { try JSONDecoder().decode(QobuzCatalogAlbum.self, from: data) } })
+                }
+            }
+        }
+    }
+
+    func artist(id: String, completion: @escaping (Result<QobuzCatalogArtist, Error>) -> Void) {
+        discoverWebPlayer { result in
+            switch result {
+            case .failure(let error): completion(.failure(error))
+            case .success(let playerInfo):
+                self.performCatalogRequest(path: "artist/get", queryItems: [
+                    URLQueryItem(name: "artist_id", value: id),
+                    URLQueryItem(name: "extra", value: "albums"),
+                    URLQueryItem(name: "limit", value: "50")
+                ], appID: playerInfo.appID) { result in
+                    completion(result.flatMap { data in Result { try JSONDecoder().decode(QobuzCatalogArtist.self, from: data) } })
+                }
+            }
+        }
+    }
+
+    private func performCatalogRequest(
+        path: String,
+        queryItems: [URLQueryItem],
+        appID: String,
+        completion: @escaping (Result<Data, Error>) -> Void
+    ) {
+        var components = URLComponents(url: Self.apiBase.appendingPathComponent(path), resolvingAgainstBaseURL: false)!
+        components.queryItems = queryItems
+        var request = URLRequest(url: components.url!)
+        request.timeoutInterval = Self.requestTimeout
+        request.setValue(appID, forHTTPHeaderField: "X-App-Id")
+        request.setValue(credentials.userAuthToken, forHTTPHeaderField: "X-User-Auth-Token")
+        session.dataTask(with: request) { data, response, error in
+            if let error = error { completion(.failure(error)); return }
+            guard let data = data, let http = response as? HTTPURLResponse else {
+                completion(.failure(QobuzStreamingError.invalidResponse))
+                return
+            }
+            guard (200..<300).contains(http.statusCode) else {
+                completion(.failure(QobuzStreamingError.api("Qobuz catalog request failed (HTTP \(http.statusCode)).")))
+                return
+            }
+            completion(.success(data))
+        }.resume()
     }
 
     func requestStreamURL(
@@ -458,8 +704,9 @@ final class QobuzStreamingClient {
                         resolution.report("Signing verified. Resolving track \(trackID)…")
                         self.requestTrackURL(trackID: trackID, appID: playerInfo.appID, secret: secret, quality: quality) { result in
                             guard !resolution.isFinished else { return }
-                            guard case .failure = result,
-                                  playerInfo.activeSecret == secret else {
+                            guard case .failure(let error) = result,
+                                  playerInfo.activeSecret == secret,
+                                  Self.isSigningRejection(error) else {
                                 resolution.finish(result)
                                 return
                             }
@@ -571,6 +818,10 @@ final class QobuzStreamingClient {
                     QobuzWebPlayerCache.saveActiveSecret(secrets[index], appID: appID)
                     completion(.success(secrets[index]))
                 case .failure(let error):
+                    guard Self.isSigningRejection(error) else {
+                        completion(.failure(error))
+                        return
+                    }
                     lastError = error
                     resolution.report("Secret \(index + 1) failed: \(error.localizedDescription)")
                     probe(index + 1)
@@ -610,7 +861,11 @@ final class QobuzStreamingClient {
                 return
             }
             guard (200..<300).contains(http.statusCode) else {
-                completion(.failure(QobuzStreamingError.api("Qobuz stream request failed (HTTP \(http.statusCode)).")))
+                if Self.isSigningRejectionResponse(data) {
+                    completion(.failure(QobuzStreamingError.signingRejected))
+                } else {
+                    completion(.failure(QobuzStreamingError.api("Qobuz stream request failed (HTTP \(http.statusCode)).")))
+                }
                 return
             }
             do {
@@ -621,6 +876,32 @@ final class QobuzStreamingClient {
                 completion(.failure(error))
             }
         }.resume()
+    }
+
+    private static func isSigningRejection(_ error: Error) -> Bool {
+        guard let error = error as? QobuzStreamingError else { return false }
+        if case .signingRejected = error { return true }
+        return false
+    }
+
+    private static func isSigningRejectionResponse(_ data: Data) -> Bool {
+        guard let body = String(data: data, encoding: .utf8)?.lowercased() else { return false }
+        let explicitMessages = [
+            "invalid signature", "signature is invalid", "signature mismatch",
+            "signature does not match", "incorrect signature", "signature rejected",
+            "invalid request signature"
+        ]
+        if explicitMessages.contains(where: body.contains) { return true }
+
+        guard let object = try? JSONSerialization.jsonObject(with: data) else { return false }
+        let signingErrorCodes: Set<String> = ["invalid_signature", "signature_invalid", "invalid_sig", "invalid_request_sig"]
+        func containsSigningCode(_ value: Any) -> Bool {
+            if let string = value as? String, signingErrorCodes.contains(string.lowercased()) { return true }
+            if let values = value as? [Any] { return values.contains(where: containsSigningCode) }
+            if let dictionary = value as? [String: Any] { return dictionary.values.contains(where: containsSigningCode) }
+            return false
+        }
+        return containsSigningCode(object)
     }
 
     private static func extractTimezoneSecrets(from script: String) -> [String] {

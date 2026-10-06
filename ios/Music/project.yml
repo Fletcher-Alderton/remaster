@@ -26,8 +26,7 @@ targets:
         buildPhase: resources
       - path: ../../QOBINE_GPL-3.0.txt
         buildPhase: resources
-      - path: Resources/FixtureArtwork
-        buildPhase: resources
+
       - path: Resources/Assets.xcassets
         buildPhase: resources
       - path: Resources/LaunchScreen.storyboard
@@ -49,8 +48,7 @@ targets:
         UIViewControllerBasedStatusBarAppearance: true
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
-        UIFileSharingEnabled: true
-        LSSupportsOpeningDocumentsInPlace: true
+
         UIBackgroundModes:
           - audio
   MusicTests:
@@ -58,6 +56,10 @@ targets:
     platform: iOS
     sources:
       - path: Tests
+        excludes:
+          - Fixtures/**
+      - path: Tests/Fixtures
+        buildPhase: resources
     dependencies:
       - target: Music
     settings:

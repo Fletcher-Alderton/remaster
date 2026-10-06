@@ -24,7 +24,7 @@ final class TabStripView: UIView {
     }
 
     func configure(titles: [String], selectedIndex: Int = 0) {
-        self.titles = Array(titles.prefix(6))
+        self.titles = Array(titles.prefix(TabConfiguration.maximumTabs))
         buttons.forEach { $0.removeFromSuperview() }
         buttons.removeAll()
 

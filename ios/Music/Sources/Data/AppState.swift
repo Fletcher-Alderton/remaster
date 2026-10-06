@@ -28,7 +28,10 @@ final class AppState {
         self.lastFMUsername = defaults.string(forKey: Key.lastFMUsername)
         self.currentTab = tabConfiguration.enabledTabs.contains(.albums)
             ? .albums
-            : (tabConfiguration.enabledTabs.first ?? .tracks)
+            : (tabConfiguration.enabledTabs.first ?? .discover)
+        if defaults.data(forKey: Key.tabConfiguration) != nil {
+            persist(tabConfiguration, key: Key.tabConfiguration)
+        }
     }
 
     func updateTabConfiguration(_ configuration: TabConfiguration) {

@@ -1,6 +1,24 @@
 import XCTest
 @testable import Music
 
+private final class StubQobuzStreamResolver: QobuzStreamResolving {
+    struct Request {
+        let trackID: Int64
+        let quality: QobuzStreamQuality
+    }
+
+    private(set) var requests: [Request] = []
+
+    func requestStreamURL(
+        trackID: Int64,
+        quality: QobuzStreamQuality,
+        progress: @escaping (String) -> Void,
+        completion: @escaping (Result<QobuzTrackURL, Error>) -> Void
+    ) {
+        requests.append(Request(trackID: trackID, quality: quality))
+    }
+}
+
 private final class QobuzHangingURLProtocol: URLProtocol {
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
@@ -57,75 +75,58 @@ final class DataLayerTests: XCTestCase {
         XCTAssertEqual(response.tracks.items[0].subtitle, "Example Artist • Example Album")
     }
 
+    func testQobuzCatalogSearchFixtureDecodesMixedIDsAndArtworkVariants() throws {
+        let data = try qobuzFixture(named: "qobuz-catalog-search")
+        let response = try JSONDecoder().decode(QobuzCatalogSearchResponse.self, from: data)
+
+        let album = try XCTUnwrap(response.albums?.items.first)
+        XCTAssertEqual(album.id, "123456")
+        XCTAssertEqual(album.year, "2024")
+        XCTAssertEqual(album.quality, "24-bit / 96000 Hz")
+        XCTAssertEqual(album.artworkURL?.absoluteString, "https://img.example/large.jpg")
+
+        let artist = try XCTUnwrap(response.artists?.items.first)
+        XCTAssertEqual(artist.id, "42")
+        XCTAssertEqual(artist.albumsCount, 3)
+
+        let track = try XCTUnwrap(response.tracks?.items.first)
+        XCTAssertEqual(track.id, 987654)
+        XCTAssertEqual(track.album?.id, "123456")
+        XCTAssertEqual(track.album?.imageURL?.absoluteString, "https://img.example/xlarge.jpg")
+        XCTAssertEqual(QobuzCatalogMapper.track(track).catalogAlbumID, "123456")
+    }
+
+    func testQobuzAlbumDetailFixtureDecodesAndMapsTracks() throws {
+        let album = try JSONDecoder().decode(QobuzCatalogAlbum.self, from: qobuzFixture(named: "qobuz-album-detail"))
+        let mapped = QobuzCatalogMapper.album(album)
+
+        XCTAssertEqual(mapped.id, "album-123456")
+        XCTAssertEqual(mapped.genre, "Jazz")
+        XCTAssertEqual(mapped.tracks.map(\.id), ["555"])
+        XCTAssertEqual(mapped.tracks.first?.catalogAlbumID, "album-123456")
+    }
+
+    func testQobuzArtistDetailFixtureDecodesBiographyAndAlbums() throws {
+        let artist = try JSONDecoder().decode(QobuzCatalogArtist.self, from: qobuzFixture(named: "qobuz-artist-detail"))
+        let mapped = QobuzCatalogMapper.profile(artist)
+
+        XCTAssertEqual(mapped.id, "42")
+        XCTAssertEqual(mapped.subtitle, "1 albums")
+        XCTAssertEqual(mapped.information, "A fixture biography.")
+        XCTAssertEqual(mapped.albums.map(\.id), ["123456"])
+    }
+
+    private func qobuzFixture(named name: String) throws -> Data {
+        let url = try XCTUnwrap(Bundle(for: DataLayerTests.self).url(forResource: name, withExtension: "json"))
+        return try Data(contentsOf: url)
+    }
+
     func testQobuzQualitiesMapToQobuzFormatIDs() {
         XCTAssertEqual(QobuzStreamQuality.allCases.map(\.rawValue), [5, 6, 7, 27])
         XCTAssertEqual(QobuzStreamQuality.cd.detail, "Lossless, 16-bit / 44.1 kHz")
         XCTAssertNotEqual(
             QobuzStreamingClient.requestSignature(trackID: 12345, timestamp: "1700000000", secret: "secret", quality: .mp3),
             QobuzStreamingClient.requestSignature(trackID: 12345, timestamp: "1700000000", secret: "secret", quality: .cd)
-        )
-    }
-
-    func testPlaybackHistoryRecordsActualListeningTimeAndMetadata() {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        defer { try? FileManager.default.removeItem(at: root) }
-        let store = PlaybackHistoryStore(documentsDirectory: root, checkpointInterval: 5)
-        let track = Track(
-            sourceFileName: "song.flac",
-            relativePath: "Qobuz/Album/song.flac",
-            title: "Song",
-            artist: "Artist",
-            albumTitle: "Album",
-            albumArtist: "Album Artist",
-            trackNumber: 2,
-            duration: 200
-        )
-        let start = Date(timeIntervalSince1970: 1_700_000_000)
-
-        store.begin(track: track, at: start)
-        store.checkpoint(at: start.addingTimeInterval(10))
-        store.pause(at: start.addingTimeInterval(18))
-        store.begin(track: track, at: start.addingTimeInterval(30))
-        store.finish(reason: .skipped, at: start.addingTimeInterval(42))
-
-        let event = store.readAllEvents().last
-        XCTAssertEqual(event?.trackID, track.id)
-        XCTAssertEqual(event?.sourceRelativePath, "Qobuz/Album/song.flac")
-        XCTAssertEqual(event?.startedAt, start)
-        XCTAssertEqual(event?.endedAt, start.addingTimeInterval(42))
-        XCTAssertEqual(event?.listenedSeconds ?? 0, 30, accuracy: 0.001)
-        XCTAssertEqual(event?.endReason, .skipped)
-        XCTAssertFalse(event?.completed ?? true)
-    }
-
-    func testFinderVisibleMusicDirectoryUsesDocuments() {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        defer { try? FileManager.default.removeItem(at: root) }
-
-        let store = LibraryStore(applicationSupportDirectory: root)
-
-        XCTAssertEqual(
-            store.importedMusicDirectory.standardizedFileURL,
-            root.appendingPathComponent("Documents", isDirectory: true).standardizedFileURL
-        )
-        XCTAssertTrue(FileManager.default.fileExists(atPath: store.importedMusicDirectory.path))
-    }
-
-    func testLegacyImportedMusicMigratesIntoFinderVisibleDirectory() throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        defer { try? FileManager.default.removeItem(at: root) }
-        let legacyDirectory = root.appendingPathComponent("ImportedMusic", isDirectory: true)
-        try FileManager.default.createDirectory(at: legacyDirectory, withIntermediateDirectories: true)
-        let legacyFile = legacyDirectory.appendingPathComponent("legacy.flac")
-        try Data([0x66, 0x4C, 0x61, 0x43]).write(to: legacyFile)
-
-        let store = LibraryStore(applicationSupportDirectory: root)
-
-        XCTAssertFalse(FileManager.default.fileExists(atPath: legacyFile.path))
-        XCTAssertTrue(
-            FileManager.default.fileExists(
-                atPath: store.importedMusicDirectory.appendingPathComponent("legacy.flac").path
-            )
         )
     }
 
@@ -185,24 +186,13 @@ final class DataLayerTests: XCTestCase {
         XCTAssertEqual(table?.tableHeaderView?.accessibilityIdentifier, "albumDetail.header")
     }
 
-    func testListLibraryTabsClearTheMiniPlayer() {
-        for kind in [LibraryScreenKind.tracks, .artists, .genres] {
-            let controller = LibraryViewController(kind: kind)
-            controller.loadViewIfNeeded()
-            let table = controller.view.subviews.compactMap { $0 as? UITableView }.first
-            let requiredClearance = DesignSystem.miniPlayerHeight + 14
-
-            XCTAssertEqual(table?.contentInset.bottom, requiredClearance)
-            XCTAssertEqual(table?.scrollIndicatorInsets.bottom, requiredClearance)
-        }
-    }
 
     func testTabConfigurationKeepsAtLeastOneUniqueTab() {
         let configuration = TabConfiguration(enabledTabs: [.albums, .albums, .artists])
         XCTAssertEqual(configuration.enabledTabs, [.albums, .artists])
-        var onlyTab = TabConfiguration(enabledTabs: [.genres])
-        onlyTab.setEnabled(false, for: .genres)
-        XCTAssertEqual(onlyTab.enabledTabs, [.genres])
+        var onlyTab = TabConfiguration(enabledTabs: [.artists])
+        onlyTab.setEnabled(false, for: .artists)
+        XCTAssertEqual(onlyTab.enabledTabs, [.artists])
     }
 
     func testQueueStateReturnsNilForInvalidCurrentIndex() {
@@ -210,84 +200,30 @@ final class DataLayerTests: XCTestCase {
         XCTAssertEqual(QueueState(trackIDs: ["a"], currentIndex: 0).currentTrackID, "a")
     }
 
-    func testStoreSearchAndAlbumDerivation() throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        defer { try? FileManager.default.removeItem(at: root) }
-        let store = LibraryStore(applicationSupportDirectory: root)
-        let track = Track(sourceFileName: "one.mp3", relativePath: "one.mp3", title: "A Song", artist: "Artist", albumTitle: "Record", albumArtist: "Artist", year: 2024, genre: "Electronic")
-        var index = store.snapshot()
-        index.tracks = [track]
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        let fixture = try encoder.encode(index)
-        try fixture.write(to: root.appendingPathComponent("LibraryIndex.json"))
-        let reloaded = LibraryStore(applicationSupportDirectory: root)
-        XCTAssertEqual(reloaded.tracks(matching: "song").map { $0.id }, [track.id])
-        XCTAssertEqual(reloaded.snapshot().albums.first?.title, "Record")
+
+    func testQobuzQueueControllerRequestsSelectedQualityAndRejectsInvalidTrackIDs() {
+        let track = ScreenTrack(id: "2468", title: "Song", artist: "Artist", album: "Album", duration: 120)
+        let client = StubQobuzStreamResolver()
+        let controller = QobuzPlaybackController(
+            client: client,
+            quality: { .hiRes96 },
+            trackProvider: { $0 == track.id ? track : nil }
+        )
+        controller.setQueue(trackIDs: [track.id], startingAt: 0)
+        controller.play()
+        XCTAssertEqual(client.requests.map(\.trackID), [2468])
+        XCTAssertEqual(client.requests.map(\.quality), [.hiRes96])
+        XCTAssertTrue(controller.queueState.isPlaying)
+
+        var errorDescription: String?
+        controller.onError = { errorDescription = $0.localizedDescription }
+        controller.setQueue(trackIDs: ["not-numeric"], startingAt: 0)
+        controller.play()
+        XCTAssertEqual(errorDescription, QobuzStreamingError.invalidQobuzTrackID.localizedDescription)
+        XCTAssertFalse(controller.queueState.isPlaying)
+        XCTAssertEqual(client.requests.count, 1)
     }
 
-    func testPlaybackSimulatorAdvancesAndStopsAtQueueEnd() {
-        let simulator = PlaybackSimulator { _ in 10 }
-        simulator.setQueue(trackIDs: ["first", "second"], startingAt: 0)
-        simulator.seek(to: 10)
-        simulator.next()
-        XCTAssertEqual(simulator.queueState.currentTrackID, "second")
-        simulator.next()
-        XCTAssertEqual(simulator.queueState.currentTrackID, "first")
-        XCTAssertFalse(simulator.queueState.isPlaying)
-    }
-
-    func testPlaybackSimulatorEnqueueAndPlayNextPreserveCurrentTrack() {
-        let simulator = PlaybackSimulator { _ in 120 }
-        simulator.setQueue(trackIDs: ["current", "last"], startingAt: 0)
-
-        simulator.enqueue(trackID: "queued")
-        XCTAssertEqual(simulator.queueState.trackIDs, ["current", "last", "queued"])
-        XCTAssertEqual(simulator.queueState.currentTrackID, "current")
-
-        simulator.playNext(trackID: "next")
-        XCTAssertEqual(simulator.queueState.trackIDs, ["current", "next", "last", "queued"])
-        XCTAssertEqual(simulator.queueState.currentTrackID, "current")
-    }
-
-    func testPlaybackSimulatorUsesFallbackForMissingDuration() {
-        let simulator = PlaybackSimulator { _ in 0 }
-        simulator.setQueue(trackIDs: ["unknown-duration"], startingAt: 0)
-        simulator.seek(to: 30)
-        XCTAssertEqual(simulator.queueState.elapsed, 30)
-    }
-
-    func testPlaybackPreviousRestartsThenMovesToPreviousTrack() {
-        let simulator = PlaybackSimulator { _ in 120 }
-        simulator.setQueue(trackIDs: ["first", "second"], startingAt: 1)
-        simulator.seek(to: 12)
-
-        simulator.previous()
-        XCTAssertEqual(simulator.queueState.currentTrackID, "second")
-        XCTAssertEqual(simulator.queueState.elapsed, 0)
-
-        simulator.previous()
-        XCTAssertEqual(simulator.queueState.currentTrackID, "first")
-        XCTAssertEqual(simulator.queueState.elapsed, 0)
-    }
-
-    func testDerivedIdentifiersDoNotCollideAfterSanitizingNames() throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        defer { try? FileManager.default.removeItem(at: root) }
-        let store = LibraryStore(applicationSupportDirectory: root)
-        var index = store.snapshot()
-        index.tracks = [
-            Track(sourceFileName: "one.mp3", relativePath: "one.mp3", title: "One", artist: "Artist", albumTitle: "A/B", albumArtist: "Artist"),
-            Track(sourceFileName: "two.mp3", relativePath: "two.mp3", title: "Two", artist: "Artist", albumTitle: "A-B", albumArtist: "Artist")
-        ]
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        try encoder.encode(index).write(to: root.appendingPathComponent("LibraryIndex.json"))
-
-        let albumIDs = LibraryStore(applicationSupportDirectory: root).snapshot().albums.map { $0.id }
-        XCTAssertEqual(albumIDs.count, 2)
-        XCTAssertEqual(Set(albumIDs).count, 2)
-    }
 
     func testSongSwipeThresholdsResolveAllFourActions() {
         let width: CGFloat = 300
@@ -304,9 +240,23 @@ final class DataLayerTests: XCTestCase {
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let state = AppState(defaults: defaults)
         state.toggleLike(trackID: "one")
-        state.updateTabConfiguration(TabConfiguration(enabledTabs: [.genres, .tracks]))
+        state.updateTabConfiguration(TabConfiguration(enabledTabs: [.albums, .artists]))
         let reloaded = AppState(defaults: defaults)
         XCTAssertTrue(reloaded.isLiked(trackID: "one"))
-        XCTAssertEqual(reloaded.tabConfiguration.enabledTabs, [.genres, .tracks])
+        XCTAssertEqual(reloaded.tabConfiguration.enabledTabs, [.albums, .artists])
+    }
+
+    func testLegacyLocalTabsAreRemovedFromPersistedPreferences() throws {
+        let suiteName = UUID().uuidString
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set(Data(#"{"enabledTabs":["genres","tracks","playlists"]}"#.utf8), forKey: "Music.AppState.tabConfiguration")
+
+        let state = AppState(defaults: defaults)
+
+        XCTAssertEqual(state.tabConfiguration.enabledTabs, [.discover])
+        let data = try XCTUnwrap(defaults.data(forKey: "Music.AppState.tabConfiguration"))
+        let saved = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: [String]])
+        XCTAssertEqual(saved["enabledTabs"], ["discover"])
     }
 }

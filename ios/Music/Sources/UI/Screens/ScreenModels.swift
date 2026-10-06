@@ -1,19 +1,11 @@
 import UIKit
 
-// These lightweight display models deliberately keep screen code independent from the
-// importer and persistence layers.  LibraryStore/AppState can map their Codable models
-// into these values on the main queue.
 
 enum AlbumQueueAction {
     case playNext
     case enqueue
 }
 
-enum LibraryScreenKind: String, CaseIterable {
-    case tracks, albums, artists, playlists, genres
-
-    var searchPlaceholder: String { return "Search " + rawValue }
-}
 
 struct ScreenTrack {
     let id: String
@@ -22,11 +14,15 @@ struct ScreenTrack {
     let album: String
     let quality: String
     let artwork: UIImage?
+    let artworkURL: URL?
+    let catalogAlbumID: String?
+    let catalogArtistID: String?
     let duration: TimeInterval
 
-    init(id: String, title: String, artist: String, album: String, quality: String = "", artwork: UIImage? = nil, duration: TimeInterval = 0) {
+    init(id: String, title: String, artist: String, album: String, quality: String = "", artwork: UIImage? = nil, artworkURL: URL? = nil, catalogAlbumID: String? = nil, catalogArtistID: String? = nil, duration: TimeInterval = 0) {
         self.id = id; self.title = title; self.artist = artist; self.album = album
-        self.quality = quality; self.artwork = artwork; self.duration = duration
+        self.quality = quality; self.artwork = artwork; self.artworkURL = artworkURL
+        self.catalogAlbumID = catalogAlbumID; self.catalogArtistID = catalogArtistID; self.duration = duration
     }
 }
 
@@ -38,11 +34,12 @@ struct ScreenAlbum {
     let genre: String
     let quality: String
     let artwork: UIImage?
+    let artworkURL: URL?
     let tracks: [ScreenTrack]
 
-    init(id: String, title: String, artist: String, year: String, genre: String = "", quality: String = "", artwork: UIImage? = nil, tracks: [ScreenTrack] = []) {
+    init(id: String, title: String, artist: String, year: String, genre: String = "", quality: String = "", artwork: UIImage? = nil, artworkURL: URL? = nil, tracks: [ScreenTrack] = []) {
         self.id = id; self.title = title; self.artist = artist; self.year = year; self.genre = genre
-        self.quality = quality; self.artwork = artwork; self.tracks = tracks
+        self.quality = quality; self.artwork = artwork; self.artworkURL = artworkURL; self.tracks = tracks
     }
 }
 
@@ -52,20 +49,15 @@ struct ScreenProfile {
     let subtitle: String
     let information: String
     let artwork: UIImage?
+    let artworkURL: URL?
     let albums: [ScreenAlbum]
 
-    init(id: String, name: String, subtitle: String, information: String, artwork: UIImage? = nil, albums: [ScreenAlbum] = []) {
+    init(id: String, name: String, subtitle: String, information: String, artwork: UIImage? = nil, artworkURL: URL? = nil, albums: [ScreenAlbum] = []) {
         self.id = id; self.name = name; self.subtitle = subtitle; self.information = information
-        self.artwork = artwork; self.albums = albums
+        self.artwork = artwork; self.artworkURL = artworkURL; self.albums = albums
     }
 }
 
-struct ScreenPlaylist {
-    let id: String
-    let name: String
-    let trackCount: Int
-    let artwork: UIImage?
-}
 
 struct SettingsTabItem: Equatable {
     let id: String

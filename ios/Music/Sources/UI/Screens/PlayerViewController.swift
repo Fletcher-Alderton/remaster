@@ -70,14 +70,23 @@ final class PlayerViewController: UIViewController, UIGestureRecognizerDelegate 
         acceptsTapGestures = false
     }
 
+    func showPlaybackStatus(_ message: String) {
+        guard isViewLoaded else { return }
+        qualityLabel.text = message
+        qualityLabel.textColor = DesignSystem.secondaryText
+        qualityLabel.numberOfLines = 2
+    }
+
     func update(state: PlayerScreenState, animated: Bool = true) {
         let playbackStateChanged = self.state.isPlaying != state.isPlaying
         self.state = state
         guard isViewLoaded else { return }
+        qualityLabel.textColor = DesignSystem.secondaryText
+        qualityLabel.numberOfLines = 1
         artworkView.image = state.track.artwork
         titleLabel.text = state.track.title
         metadataLabel.text = "\(state.track.artist) — \(state.track.album)"
-        qualityLabel.text = state.track.quality
+        qualityLabel.text = state.track.quality.isEmpty ? "Qobuz" : state.track.quality
         elapsedLabel.text = state.elapsed.screenTime
         durationLabel.text = state.duration.screenTime
         let progress = state.duration > 0 ? CGFloat(state.elapsed / state.duration) : 0

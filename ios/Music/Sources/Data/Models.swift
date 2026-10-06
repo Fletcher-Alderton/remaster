@@ -1,116 +1,20 @@
 import Foundation
 
 enum LibraryTab: String, Codable, CaseIterable {
-    case tracks
+    case discover
+    case search
     case albums
     case artists
-    case playlists
-    case genres
     case settings
 
     var title: String {
         switch self {
-        case .tracks: return "Tracks"
+        case .discover: return "Discover"
+        case .search: return "Search"
         case .albums: return "Albums"
         case .artists: return "Artists"
-        case .playlists: return "Playlists"
-        case .genres: return "Genres"
         case .settings: return "Settings"
         }
-    }
-}
-
-struct Track: Codable, Equatable, Hashable {
-    var id: String
-    var sourceFileName: String
-    var relativePath: String
-    var title: String
-    var artist: String
-    var albumTitle: String
-    var albumArtist: String
-    var year: Int?
-    var genre: String
-    var trackNumber: Int?
-    var discNumber: Int?
-    var duration: TimeInterval
-    var formatDescription: String
-    var artworkFileName: String?
-    var byteSize: Int64
-    var importedAt: Date
-
-    init(id: String = UUID().uuidString,
-         sourceFileName: String,
-         relativePath: String,
-         title: String,
-         artist: String = "Unknown Artist",
-         albumTitle: String = "Unknown Album",
-         albumArtist: String = "Unknown Artist",
-         year: Int? = nil,
-         genre: String = "Unknown",
-         trackNumber: Int? = nil,
-         discNumber: Int? = nil,
-         duration: TimeInterval = 0,
-         formatDescription: String = "Unknown format",
-         artworkFileName: String? = nil,
-         byteSize: Int64 = 0,
-         importedAt: Date = Date()) {
-        self.id = id
-        self.sourceFileName = sourceFileName
-        self.relativePath = relativePath
-        self.title = title
-        self.artist = artist
-        self.albumTitle = albumTitle
-        self.albumArtist = albumArtist
-        self.year = year
-        self.genre = genre
-        self.trackNumber = trackNumber
-        self.discNumber = discNumber
-        self.duration = duration
-        self.formatDescription = formatDescription
-        self.artworkFileName = artworkFileName
-        self.byteSize = byteSize
-        self.importedAt = importedAt
-    }
-}
-
-struct Album: Codable, Equatable, Hashable {
-    var id: String
-    var title: String
-    var artist: String
-    var year: Int?
-    var genre: String
-    var trackIDs: [String]
-    var artworkFileName: String?
-    var duration: TimeInterval
-}
-
-struct Artist: Codable, Equatable, Hashable {
-    var id: String
-    var name: String
-    var albumIDs: [String]
-    var trackIDs: [String]
-    var artworkFileName: String?
-}
-
-struct Genre: Codable, Equatable, Hashable {
-    var id: String
-    var name: String
-    var albumIDs: [String]
-    var trackIDs: [String]
-    var artworkFileName: String?
-}
-
-struct Playlist: Codable, Equatable, Hashable {
-    var id: String
-    var name: String
-    var trackIDs: [String]
-    var createdAt: Date
-
-    init(id: String = UUID().uuidString, name: String, trackIDs: [String] = [], createdAt: Date = Date()) {
-        self.id = id
-        self.name = name
-        self.trackIDs = trackIDs
-        self.createdAt = createdAt
     }
 }
 
@@ -135,42 +39,30 @@ struct QueueState: Codable, Equatable {
     }
 }
 
-struct LibraryIndex: Codable, Equatable {
-    static let currentSchemaVersion = 2
-
-    var schemaVersion: Int
-    var tracks: [Track]
-    var albums: [Album]
-    var artists: [Artist]
-    var genres: [Genre]
-    var playlists: [Playlist]
-    var updatedAt: Date
-
-    init(schemaVersion: Int = LibraryIndex.currentSchemaVersion,
-         tracks: [Track] = [],
-         albums: [Album] = [],
-         artists: [Artist] = [],
-         genres: [Genre] = [],
-         playlists: [Playlist] = [],
-         updatedAt: Date = Date()) {
-        self.schemaVersion = schemaVersion
-        self.tracks = tracks
-        self.albums = albums
-        self.artists = artists
-        self.genres = genres
-        self.playlists = playlists
-        self.updatedAt = updatedAt
-    }
-}
 
 struct TabConfiguration: Codable, Equatable {
-    static let maximumTabs = 6
+    static let maximumTabs = 4
     static let minimumTabs = 1
 
     var enabledTabs: [LibraryTab]
 
-    init(enabledTabs: [LibraryTab] = [.tracks, .albums, .artists, .playlists, .genres]) {
+    private enum CodingKeys: String, CodingKey {
+        case enabledTabs
+    }
+
+    init(enabledTabs: [LibraryTab] = [.discover, .search, .albums, .artists]) {
         self.enabledTabs = TabConfiguration.normalized(enabledTabs)
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let rawTabs = try container.decodeIfPresent([String].self, forKey: .enabledTabs) ?? []
+        self.enabledTabs = TabConfiguration.normalized(rawTabs.compactMap(LibraryTab.init(rawValue:)))
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(enabledTabs.map(\.rawValue), forKey: .enabledTabs)
     }
 
     static func normalized(_ tabs: [LibraryTab]) -> [LibraryTab] {
@@ -178,7 +70,7 @@ struct TabConfiguration: Codable, Equatable {
         for tab in tabs where !unique.contains(tab) && unique.count < maximumTabs {
             unique.append(tab)
         }
-        if unique.isEmpty { unique = [.tracks] }
+        if unique.isEmpty { unique = [.discover] }
         return unique
     }
 
@@ -197,18 +89,4 @@ struct TabConfiguration: Codable, Equatable {
         let tab = enabledTabs.remove(at: source)
         enabledTabs.insert(tab, at: destination)
     }
-}
-
-enum TrackSort: String, Codable, CaseIterable {
-    case titleAscending
-    case titleDescending
-    case artist
-    case newest
-}
-
-enum AlbumSort: String, Codable, CaseIterable {
-    case titleAscending
-    case titleDescending
-    case newest
-    case oldest
 }
