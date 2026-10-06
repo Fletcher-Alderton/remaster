@@ -1,14 +1,12 @@
-import AVFoundation
 import SafariServices
 import UIKit
 
-/// Standalone live-stream spike, intentionally separate from the local-file queue.
+/// Standalone live-stream spike used to validate Qobuz stream resolution and playback.
 final class QobuzStreamTestViewController: UIViewController, UITextFieldDelegate, UITableViewDataSource, UITableViewDelegate {
     private let credentialsStore = QobuzCredentialStore()
+    private let streamPlayer = QobuzStreamPlayer()
     private var authSession: SFAuthenticationSession?
-    private var player: AVPlayer?
-    private var itemObservation: NSKeyValueObservation?
-    private var timeObserver: Any?
+    private var playbackStatusMessage: String?
 
     private let accountButton = UIButton(type: .system)
     private let trackIDField = UITextField()
@@ -31,12 +29,28 @@ final class QobuzStreamTestViewController: UIViewController, UITextFieldDelegate
         view.backgroundColor = DesignSystem.settingsBackground
         buildView()
         updateAccountButton()
+        streamPlayer.onStatusChange = { [weak self] status in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                switch status {
+                case .playing:
+                    self.playButton.setTitle("Pause", for: .normal)
+                    self.statusLabel.text = self.playbackStatusMessage ?? "Playing Qobuz stream. Test seeking and playback stability."
+                case .paused:
+                    self.playButton.setTitle("Play", for: .normal)
+                case .failed(let error):
+                    self.showError(error)
+                }
+            }
+        }
+        streamPlayer.onTimeChange = { [weak self] elapsed, duration in
+            self?.seekSlider.value = Float(elapsed / duration)
+            self?.timeLabel.text = "\(Self.timeString(elapsed)) / \(Self.timeString(duration))"
+        }
     }
 
     deinit {
-        itemObservation?.invalidate()
-        if let timeObserver = timeObserver { player?.removeTimeObserver(timeObserver) }
-        player?.pause()
+        streamPlayer.stop()
     }
 
     private func buildView() {
@@ -392,55 +406,15 @@ final class QobuzStreamTestViewController: UIViewController, UITextFieldDelegate
     }
 
     private func startPlayback(url: URL) {
-        itemObservation?.invalidate()
-        if let timeObserver = timeObserver { player?.removeTimeObserver(timeObserver) }
-        let item = AVPlayerItem(asset: AVURLAsset(url: url))
-        let player = AVPlayer(playerItem: item)
-        self.player = player
-        itemObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] observedItem, _ in
-            DispatchQueue.main.async {
-                switch observedItem.status {
-                case .readyToPlay:
-                    do { try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: []) }
-                    catch { self?.showError(error); return }
-                    try? AVAudioSession.sharedInstance().setActive(true)
-                    player.play()
-                    self?.playButton.setTitle("Pause", for: .normal)
-                    self?.statusLabel.text = "Playing Qobuz stream. Test seeking and playback stability."
-                case .failed:
-                    self?.showError(observedItem.error ?? QobuzStreamingError.invalidResponse)
-                default: break
-                }
-            }
-        }
-        timeObserver = player.addPeriodicTimeObserver(
-            forInterval: CMTime(seconds: 0.5, preferredTimescale: 600),
-            queue: .main
-        ) { [weak self] time in
-            let elapsed = CMTimeGetSeconds(time)
-            let duration = CMTimeGetSeconds(item.duration)
-            guard elapsed.isFinite, duration.isFinite, duration > 0 else { return }
-            self?.seekSlider.value = Float(elapsed / duration)
-            self?.timeLabel.text = "\(Self.timeString(elapsed)) / \(Self.timeString(duration))"
-        }
+        streamPlayer.play(url: url)
     }
 
     @objc private func togglePlayback() {
-        guard let player = player else { return }
-        if player.rate == 0 {
-            player.play()
-            playButton.setTitle("Pause", for: .normal)
-        } else {
-            player.pause()
-            playButton.setTitle("Play", for: .normal)
-        }
+        streamPlayer.togglePlayback()
     }
 
     @objc private func seekChanged() {
-        guard let duration = player?.currentItem?.duration else { return }
-        let seconds = CMTimeGetSeconds(duration) * Double(seekSlider.value)
-        guard seconds.isFinite else { return }
-        player?.seek(to: CMTime(seconds: seconds, preferredTimescale: 600))
+        streamPlayer.seek(to: seekSlider.value)
     }
 
     @objc private func closeTapped() { dismiss(animated: true) }
