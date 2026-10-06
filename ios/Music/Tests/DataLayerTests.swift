@@ -1,7 +1,71 @@
 import XCTest
 @testable import Music
 
+private final class QobuzHangingURLProtocol: URLProtocol {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {}
+    override func stopLoading() {}
+}
+
 final class DataLayerTests: XCTestCase {
+    func testQobuzMP3RequestSignatureMatchesQobineProtocol() {
+        XCTAssertEqual(
+            QobuzStreamingClient.requestSignature(trackID: 64_868_955, timestamp: "1700000000", secret: "secret"),
+            "1dee430e89644d6427a863d8905896ae"
+        )
+    }
+
+    func testQobuzResolutionTimeoutCompletesOnce() {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [QobuzHangingURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        let client = QobuzStreamingClient(
+            credentials: QobuzCredentials(userAuthToken: "test-token", userID: 1),
+            session: session,
+            resolutionTimeout: 0.05
+        )
+        let completed = expectation(description: "resolution finishes at deadline")
+        var result: Result<QobuzTrackURL, Error>?
+
+        client.requestStreamURL(trackID: 1, quality: .mp3) { value in
+            result = value
+            completed.fulfill()
+        }
+        wait(for: [completed], timeout: 2)
+        session.invalidateAndCancel()
+
+        guard case .failure(let error)? = result else {
+            return XCTFail("Expected a timeout error")
+        }
+        XCTAssertEqual(error.localizedDescription, QobuzStreamingError.resolutionTimedOut.localizedDescription)
+    }
+
+    func testQobuzTrackURLDecodesQobineResponseShape() throws {
+        let json = Data(#"{"url":"https://media.example/track.mp3","format_id":5,"mime_type":"audio/mpeg","sampling_rate":44.1,"bit_depth":16}"#.utf8)
+        let result = try JSONDecoder().decode(QobuzTrackURL.self, from: json)
+        XCTAssertEqual(result.formatID, QobuzStreamQuality.mp3.rawValue)
+        XCTAssertEqual(result.mimeType, "audio/mpeg")
+        XCTAssertEqual(result.url.host, "media.example")
+    }
+
+    func testQobuzTrackSearchDecodesResults() throws {
+        let json = Data(#"{"tracks":{"items":[{"id":12345,"title":"Example Song","duration":210,"performer":{"name":"Example Artist"},"album":{"title":"Example Album"}}]}}"#.utf8)
+        let response = try JSONDecoder().decode(QobuzTrackSearchResponse.self, from: json)
+        XCTAssertEqual(response.tracks.items.count, 1)
+        XCTAssertEqual(response.tracks.items[0].id, 12345)
+        XCTAssertEqual(response.tracks.items[0].subtitle, "Example Artist • Example Album")
+    }
+
+    func testQobuzQualitiesMapToQobuzFormatIDs() {
+        XCTAssertEqual(QobuzStreamQuality.allCases.map(\.rawValue), [5, 6, 7, 27])
+        XCTAssertEqual(QobuzStreamQuality.cd.detail, "Lossless, 16-bit / 44.1 kHz")
+        XCTAssertNotEqual(
+            QobuzStreamingClient.requestSignature(trackID: 12345, timestamp: "1700000000", secret: "secret", quality: .mp3),
+            QobuzStreamingClient.requestSignature(trackID: 12345, timestamp: "1700000000", secret: "secret", quality: .cd)
+        )
+    }
+
     func testPlaybackHistoryRecordsActualListeningTimeAndMetadata() {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -64,6 +128,7 @@ final class DataLayerTests: XCTestCase {
             )
         )
     }
+
 
     func testAutomaticAppearanceUsesLocalNightHours() {
         XCTAssertTrue(ThemeManager.isNight(hour: 0))

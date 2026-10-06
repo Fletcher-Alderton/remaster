@@ -5,6 +5,7 @@ final class SettingsViewController: UIViewController, UITableViewDataSource, UIT
     var onImport: (() -> Void)?
     var onLastFMChanged: ((String?) -> Void)?
     var onAppearanceChanged: ((AppearanceMode) -> Void)?
+    var onQobuzStreamTest: (() -> Void)?
     var onDismissSwipe: (() -> Void)?
 
     private var items: [SettingsTabItem]
@@ -18,6 +19,8 @@ final class SettingsViewController: UIViewController, UITableViewDataSource, UIT
     private let tabsTable = UITableView(frame: .zero, style: .plain)
     private let musicGroup = UIView()
     private let importValueLabel = UILabel()
+    private let qobuzGroup = UIView()
+    private let qobuzTestButton = UIButton(type: .system)
     private let scrobblingGroup = UIView()
     private let lastFMField = UITextField()
     private let lastFMButton = UIButton(type: .system)
@@ -114,6 +117,17 @@ final class SettingsViewController: UIViewController, UITableViewDataSource, UIT
         musicGroup.addSubview(importValueLabel)
         musicGroup.addSubview(importButton)
 
+        let qobuzSection = sectionLabel("Streaming (Test)")
+        contentView.addSubview(qobuzSection)
+        configure(group: qobuzGroup)
+        contentView.addSubview(qobuzGroup)
+        qobuzTestButton.translatesAutoresizingMaskIntoConstraints = false
+        qobuzTestButton.setTitle("Open Qobuz Stream Test", for: .normal)
+        qobuzTestButton.setTitleColor(DesignSystem.accent, for: .normal)
+        qobuzTestButton.titleLabel?.font = DesignSystem.font(10, weight: .semibold)
+        qobuzTestButton.addTarget(self, action: #selector(qobuzTestTapped), for: .touchUpInside)
+        qobuzGroup.addSubview(qobuzTestButton)
+
         let scrobblingSection = sectionLabel("Scrobbling")
         contentView.addSubview(scrobblingSection)
         configure(group: scrobblingGroup)
@@ -175,8 +189,17 @@ final class SettingsViewController: UIViewController, UITableViewDataSource, UIT
             importButton.trailingAnchor.constraint(equalTo: musicGroup.trailingAnchor, constant: -9),
             importButton.centerYAnchor.constraint(equalTo: musicGroup.centerYAnchor),
 
+            qobuzSection.leadingAnchor.constraint(equalTo: tabsSection.leadingAnchor),
+            qobuzSection.topAnchor.constraint(equalTo: musicGroup.bottomAnchor, constant: 18),
+            qobuzGroup.leadingAnchor.constraint(equalTo: tabsTable.leadingAnchor),
+            qobuzGroup.trailingAnchor.constraint(equalTo: tabsTable.trailingAnchor),
+            qobuzGroup.topAnchor.constraint(equalTo: qobuzSection.bottomAnchor, constant: 6),
+            qobuzGroup.heightAnchor.constraint(equalToConstant: 48),
+            qobuzTestButton.leadingAnchor.constraint(equalTo: qobuzGroup.leadingAnchor, constant: 10),
+            qobuzTestButton.centerYAnchor.constraint(equalTo: qobuzGroup.centerYAnchor),
+
             scrobblingSection.leadingAnchor.constraint(equalTo: tabsSection.leadingAnchor),
-            scrobblingSection.topAnchor.constraint(equalTo: musicGroup.bottomAnchor, constant: 18),
+            scrobblingSection.topAnchor.constraint(equalTo: qobuzGroup.bottomAnchor, constant: 18),
             scrobblingGroup.leadingAnchor.constraint(equalTo: tabsTable.leadingAnchor),
             scrobblingGroup.trailingAnchor.constraint(equalTo: tabsTable.trailingAnchor),
             scrobblingGroup.topAnchor.constraint(equalTo: scrobblingSection.bottomAnchor, constant: 6),
@@ -342,6 +365,8 @@ final class SettingsViewController: UIViewController, UITableViewDataSource, UIT
         appearanceMode = AppearanceMode.allCases[appearanceControl.selectedSegmentIndex]
         onAppearanceChanged?(appearanceMode)
     }
+
+    @objc private func qobuzTestTapped() { onQobuzStreamTest?() }
 
     @objc private func lastFMTapped() {
         if lastFMUsername != nil {

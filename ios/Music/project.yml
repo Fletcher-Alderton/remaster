@@ -18,9 +18,14 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.fletcher.MusicPrototype
+        CODE_SIGN_ENTITLEMENTS: Music.entitlements
         TARGETED_DEVICE_FAMILY: "1"
     sources:
       - path: Sources
+      - path: ../../THIRD_PARTY_NOTICES.md
+        buildPhase: resources
+      - path: ../../QOBINE_GPL-3.0.txt
+        buildPhase: resources
       - path: Resources/FixtureArtwork
         buildPhase: resources
       - path: Resources/Assets.xcassets
@@ -34,6 +39,10 @@ targets:
         CFBundleName: Music
         CFBundleShortVersionString: "1.0"
         CFBundleVersion: "1"
+        CFBundleURLTypes:
+          - CFBundleURLName: com.fletcher.MusicPrototype.qobuz-oauth
+            CFBundleURLSchemes:
+              - qobuz-music
         UILaunchStoryboardName: LaunchScreen
         UIRequiresFullScreen: true
         UIStatusBarHidden: true

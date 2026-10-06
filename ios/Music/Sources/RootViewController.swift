@@ -316,6 +316,7 @@ final class RootViewController: UIViewController, UIDocumentPickerDelegate {
             self.refreshTabStrip()
         }
         controller.onImport = { [weak self] in self?.showDocumentPicker() }
+        controller.onQobuzStreamTest = { [weak self] in self?.showQobuzStreamTest() }
         controller.onLastFMChanged = { [weak self] username in self?.appState.setLastFMUsername(username) }
         controller.onAppearanceChanged = { mode in ThemeManager.mode = mode }
         controller.onDismissSwipe = { [weak self] in
@@ -712,6 +713,12 @@ final class RootViewController: UIViewController, UIDocumentPickerDelegate {
         case .genres: return .genres
         case .settings: return nil
         }
+    }
+
+    private func showQobuzStreamTest() {
+        let controller = QobuzStreamTestViewController()
+        controller.modalPresentationStyle = .fullScreen
+        present(controller, animated: true)
     }
 
     private func showDocumentPicker() {
