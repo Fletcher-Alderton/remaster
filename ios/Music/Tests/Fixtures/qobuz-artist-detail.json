@@ -1,0 +1,17 @@
+{
+  "id": 42,
+  "name": "Detail Artist",
+  "albums_count": 1,
+  "biography": { "summary": "A fixture biography." },
+  "albums": {
+    "items": [
+      {
+        "id": 123456,
+        "title": "Artist Album",
+        "artist": { "id": 42, "name": "Detail Artist" },
+        "tracks": { "items": [] }
+      }
+    ],
+    "total": 1
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "id": "album-123456",
+  "title": "Detail Album",
+  "artist": { "id": 42, "name": "Detail Artist" },
+  "genre": { "name": "Jazz" },
+  "release_date_original": "1998-11-01",
+  "maximum_bit_depth": 24,
+  "maximum_sampling_rate": 96.0,
+  "tracks": {
+    "items": [
+      { "id": 555, "title": "First Track", "duration": 180, "performer": { "name": "Detail Artist" }, "album": { "id": "album-123456", "title": "Detail Album" } }
+    ]
+  }
+}

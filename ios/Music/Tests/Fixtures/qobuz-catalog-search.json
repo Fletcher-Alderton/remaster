@@ -1,0 +1,38 @@
+{
+  "albums": {
+    "items": [
+      {
+        "id": 123456,
+        "title": "Catalog Album",
+        "artist": { "id": "artist-42", "name": "Catalog Artist" },
+        "image": { "small": "https://img.example/small.jpg", "large": "https://img.example/large.jpg" },
+        "release_date_original": "2024-03-15",
+        "maximum_bit_depth": 24,
+        "maximum_sampling_rate": 96.0
+      }
+    ],
+    "total": 1
+  },
+  "artists": {
+    "items": [
+      { "id": 42, "name": "Catalog Artist", "albums_count": 3, "picture": "https://img.example/artist.jpg" }
+    ],
+    "total": 1
+  },
+  "tracks": {
+    "items": [
+      {
+        "id": 987654,
+        "title": "Catalog Track",
+        "duration": 215,
+        "performer": { "name": "Catalog Artist" },
+        "album": {
+          "id": 123456,
+          "title": "Catalog Album",
+          "image": { "large": "https://img.example/large.jpg", "extaLarge": "https://img.example/xlarge.jpg" }
+        }
+      }
+    ],
+    "total": 1
+  }
+}
