@@ -5,6 +5,7 @@ enum LibraryTab: String, Codable, CaseIterable {
     case search
     case albums
     case artists
+    case tracks
     case settings
 
     var title: String {
@@ -13,6 +14,7 @@ enum LibraryTab: String, Codable, CaseIterable {
         case .search: return "Search"
         case .albums: return "Albums"
         case .artists: return "Artists"
+        case .tracks: return "Tracks"
         case .settings: return "Settings"
         }
     }
@@ -41,28 +43,38 @@ struct QueueState: Codable, Equatable {
 
 
 struct TabConfiguration: Codable, Equatable {
-    static let maximumTabs = 4
+    static let maximumTabs = 5
     static let minimumTabs = 1
+    private static let currentLibraryTabsVersion = 1
 
     var enabledTabs: [LibraryTab]
 
     private enum CodingKeys: String, CodingKey {
         case enabledTabs
+        case libraryTabsVersion
     }
 
-    init(enabledTabs: [LibraryTab] = [.discover, .search, .albums, .artists]) {
+    init(enabledTabs: [LibraryTab] = [.discover, .search, .albums, .artists, .tracks]) {
         self.enabledTabs = TabConfiguration.normalized(enabledTabs)
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let rawTabs = try container.decodeIfPresent([String].self, forKey: .enabledTabs) ?? []
-        self.enabledTabs = TabConfiguration.normalized(rawTabs.compactMap(LibraryTab.init(rawValue:)))
+        var tabs = TabConfiguration.normalized(rawTabs.compactMap(LibraryTab.init(rawValue:)))
+        let version = try container.decodeIfPresent(Int.self, forKey: .libraryTabsVersion) ?? 0
+        // Introduce only the new tab for existing users; preserve their order and
+        // deliberate hiding of old tabs. Versioned saves also preserve hidden Tracks.
+        if version < TabConfiguration.currentLibraryTabsVersion && !tabs.contains(.tracks) {
+            tabs.append(.tracks)
+        }
+        self.enabledTabs = TabConfiguration.normalized(tabs)
     }
 
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(enabledTabs.map(\.rawValue), forKey: .enabledTabs)
+        try container.encode(TabConfiguration.currentLibraryTabsVersion, forKey: .libraryTabsVersion)
     }
 
     static func normalized(_ tabs: [LibraryTab]) -> [LibraryTab] {

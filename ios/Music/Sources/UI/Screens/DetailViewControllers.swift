@@ -83,12 +83,16 @@ final class AlbumDetailViewController: UIViewController, UITableViewDataSource, 
 }
 
 private final class AlbumHeader: UIView {
+    private let art = ArtworkView(image: nil, cornerRadius: DesignSystem.albumArtworkCornerRadius)
+    private lazy var artworkLoader = DetailArtworkLoader(artworkView: art)
+
     init(album: ScreenAlbum, onArtist: @escaping () -> Void, onPlay: @escaping (Bool) -> Void) {
         super.init(frame: .zero)
         accessibilityIdentifier = "albumDetail.header"
         backgroundColor = DesignSystem.pageBackground
 
-        let art = ArtworkView(image: album.artwork, cornerRadius: DesignSystem.albumArtworkCornerRadius)
+        artworkLoader.configure(image: album.artwork, url: album.artworkURL)
+        artworkLoader.load(pointSize: 102)
         let title = ScreenPalette.label(album.title, font: .systemFont(ofSize: 19, weight: .bold), lines: 2)
         title.accessibilityIdentifier = "albumDetail.title"
         let artist = UIButton(type: .system)
@@ -144,75 +148,167 @@ private final class AlbumHeader: UIView {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 }
 
-final class ProfileDetailViewController: UIViewController, UICollectionViewDataSource, UICollectionViewDelegate, UICollectionViewDelegateFlowLayout, UIGestureRecognizerDelegate {
-    var profile: ScreenProfile { didSet { collection.reloadData() } }
+// A table keeps top tracks on the same swipe/long-press path as album tracks.
+// Release rows retain the two-column grid without nesting scroll views.
+final class ProfileDetailViewController: UIViewController, UITableViewDataSource, UITableViewDelegate, UIGestureRecognizerDelegate {
+    var profile: ScreenProfile { didSet { reload() } }
     var onAlbumSelected: ((ScreenAlbum) -> Void)?
     var onAlbumQueueRequested: ((ScreenAlbum) -> Void)?
+    var onTrackSelected: ((ScreenTrack) -> Void)?
+    var onTrackNavigationRequested: ((ScreenTrack) -> Void)?
+    var onSongSwipeAction: ((ScreenTrack, SongSwipeAction) -> Void)?
     var onDismissSwipe: (() -> Void)?
-    private let collection: UICollectionView
-    private lazy var albumLongPress = UILongPressGestureRecognizer(target: self, action: #selector(albumLongPressed(_:)))
+
+    private enum Section { case tracks, albums }
+    private var sections: [Section] {
+        var result: [Section] = []
+        if !profile.tracks.isEmpty { result.append(.tracks) }
+        if !profile.albums.isEmpty { result.append(.albums) }
+        return result
+    }
+    private let table = UITableView(frame: .zero, style: .plain)
+    private var songSwipeCoordinator: SongListSwipeCoordinator?
+
     init(profile: ScreenProfile) {
         self.profile = profile
-        let flow = UICollectionViewFlowLayout()
-        flow.minimumInteritemSpacing = 16
-        flow.minimumLineSpacing = 24
-        flow.sectionInset = UIEdgeInsets(top: 14, left: 14, bottom: 90, right: 14)
-        flow.headerReferenceSize = CGSize(width: DesignSystem.screenWidth, height: 236)
-        collection = UICollectionView(frame: .zero, collectionViewLayout: flow)
         super.init(nibName: nil, bundle: nil)
         modalPresentationCapturesStatusBarAppearance = true
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     override var prefersStatusBarHidden: Bool { return true }
+
     override func viewDidLoad() {
-        super.viewDidLoad(); view.accessibilityIdentifier = "profileDetail"; view.backgroundColor = DesignSystem.pageBackground
-        collection.translatesAutoresizingMaskIntoConstraints = false
-        collection.backgroundColor = DesignSystem.pageBackground
-        collection.alwaysBounceVertical = true
-        collection.dataSource = self
-        collection.delegate = self
-        collection.register(AlbumCardCellReuse.self, forCellWithReuseIdentifier: AlbumCardCellReuse.id)
-        collection.register(ProfileCollectionHeader.self, forSupplementaryViewOfKind: UICollectionView.elementKindSectionHeader, withReuseIdentifier: ProfileCollectionHeader.id)
-        albumLongPress.minimumPressDuration = 0.45
-        collection.addGestureRecognizer(albumLongPress)
-        view.addSubview(collection)
+        super.viewDidLoad()
+        view.accessibilityIdentifier = "profileDetail"
+        view.backgroundColor = DesignSystem.pageBackground
+        table.translatesAutoresizingMaskIntoConstraints = false
+        table.backgroundColor = DesignSystem.pageBackground
+        table.alwaysBounceVertical = true
+        table.showsVerticalScrollIndicator = false
+        table.separatorStyle = .none
+        table.contentInset.bottom = 90
+        table.dataSource = self
+        table.delegate = self
+        table.register(AlbumTrackCell.self, forCellReuseIdentifier: AlbumTrackCell.reuseID)
+        table.register(ProfileAlbumRowCell.self, forCellReuseIdentifier: ProfileAlbumRowCell.reuseID)
+        table.tableHeaderView = ProfileHeader(profile: profile)
+        view.addSubview(table)
+        songSwipeCoordinator = SongListSwipeCoordinator(tableView: table)
         NSLayoutConstraint.activate([
-            collection.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            collection.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            collection.topAnchor.constraint(equalTo: view.topAnchor),
-            collection.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+            table.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            table.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            table.topAnchor.constraint(equalTo: view.topAnchor),
+            table.bottomAnchor.constraint(equalTo: view.bottomAnchor)
         ])
         let dismissGesture = UISwipeGestureRecognizer(target: self, action: #selector(dismissSwipe(_:)))
         dismissGesture.direction = .down
         dismissGesture.delegate = self
         view.addGestureRecognizer(dismissGesture)
     }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        sizeHeaderToFit()
+    }
+
+    private func reload() {
+        guard isViewLoaded else { return }
+        table.tableHeaderView = ProfileHeader(profile: profile)
+        table.reloadData()
+        sizeHeaderToFit()
+    }
+
+    private func sizeHeaderToFit() {
+        guard let header = table.tableHeaderView, table.bounds.width > 0 else { return }
+        let width = table.bounds.width
+        let height = ceil(header.systemLayoutSizeFitting(
+            CGSize(width: width, height: UIView.layoutFittingCompressedSize.height),
+            withHorizontalFittingPriority: .required,
+            verticalFittingPriority: .fittingSizeLevel
+        ).height)
+        let size = CGSize(width: width, height: height)
+        guard header.frame.size != size else { return }
+        header.frame = CGRect(origin: .zero, size: size)
+        table.tableHeaderView = header
+    }
+
     @objc private func dismissSwipe(_ recognizer: UISwipeGestureRecognizer) {
-        let topOffset = -collection.adjustedContentInset.top
-        guard collection.contentOffset.y <= topOffset + 1 else { return }
+        let topOffset = -table.adjustedContentInset.top
+        guard table.contentOffset.y <= topOffset + 1 else { return }
         onDismissSwipe?()
     }
+
     func gestureRecognizer(
         _ gestureRecognizer: UIGestureRecognizer,
         shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
     ) -> Bool { return true }
-    @objc private func albumLongPressed(_ gesture: UILongPressGestureRecognizer) {
-        guard gesture.state == .began,
-              let indexPath = collection.indexPathForItem(at: gesture.location(in: collection)),
-              profile.albums.indices.contains(indexPath.item) else { return }
-        onAlbumQueueRequested?(profile.albums[indexPath.item])
+
+    func numberOfSections(in tableView: UITableView) -> Int { return sections.count }
+
+    func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
+        switch sections[section] {
+        case .tracks: return profile.tracks.count
+        case .albums: return (profile.albums.count + 1) / 2
+        }
     }
-    func collectionView(_ collectionView: UICollectionView, numberOfItemsInSection section: Int) -> Int { return profile.albums.count }
-    func collectionView(_ collectionView: UICollectionView, viewForSupplementaryElementOfKind kind: String, at indexPath: IndexPath) -> UICollectionReusableView {
-        let header = collectionView.dequeueReusableSupplementaryView(ofKind: kind, withReuseIdentifier: ProfileCollectionHeader.id, for: indexPath) as! ProfileCollectionHeader
-        header.configure(profile)
+
+    func tableView(_ tableView: UITableView, viewForHeaderInSection section: Int) -> UIView? {
+        let header = UIView()
+        header.backgroundColor = DesignSystem.pageBackground
+        let label = ScreenPalette.label(sections[section] == .tracks ? "Top Tracks" : "Albums", font: .systemFont(ofSize: 23, weight: .bold))
+        header.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 14),
+            label.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -14),
+            label.centerYAnchor.constraint(equalTo: header.centerYAnchor)
+        ])
         return header
     }
-    func collectionView(_ collectionView: UICollectionView, cellForItemAt indexPath: IndexPath) -> UICollectionViewCell { let cell = collectionView.dequeueReusableCell(withReuseIdentifier: AlbumCardCellReuse.id, for: indexPath) as! AlbumCardCellReuse; cell.configure(profile.albums[indexPath.item]); return cell }
-    func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) { onAlbumSelected?(profile.albums[indexPath.item]) }
-    func collectionView(_ collectionView: UICollectionView, didHighlightItemAt indexPath: IndexPath) { if let cell = collectionView.cellForItem(at: indexPath) { InteractionMotion.setRow(cell, highlighted: true) } }
-    func collectionView(_ collectionView: UICollectionView, didUnhighlightItemAt indexPath: IndexPath) { if let cell = collectionView.cellForItem(at: indexPath) { InteractionMotion.setRow(cell, highlighted: false) } }
-    func collectionView(_ collectionView: UICollectionView, layout collectionViewLayout: UICollectionViewLayout, sizeForItemAt indexPath: IndexPath) -> CGSize { let w = floor((collectionView.bounds.width - 44) / 2); return CGSize(width: w, height: w + 46) }
+
+    func tableView(_ tableView: UITableView, heightForHeaderInSection section: Int) -> CGFloat { return 40 }
+
+    func tableView(_ tableView: UITableView, heightForRowAt indexPath: IndexPath) -> CGFloat {
+        return sections[indexPath.section] == .tracks ? 62 : floor((tableView.bounds.width - 44) / 2) + 70
+    }
+
+    func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+        switch sections[indexPath.section] {
+        case .tracks:
+            let track = profile.tracks[indexPath.row]
+            let cell = tableView.dequeueReusableCell(withIdentifier: AlbumTrackCell.reuseID, for: indexPath) as! AlbumTrackCell
+            cell.configure(track: track, number: indexPath.row + 1)
+            cell.onSwipeAction = { [weak self] action in self?.onSongSwipeAction?(track, action) }
+            cell.onLongPress = { [weak self] in self?.onTrackNavigationRequested?(track) }
+            return cell
+        case .albums:
+            let cell = tableView.dequeueReusableCell(withIdentifier: ProfileAlbumRowCell.reuseID, for: indexPath) as! ProfileAlbumRowCell
+            let firstIndex = indexPath.row * 2
+            let secondIndex = firstIndex + 1
+            cell.configure(
+                first: profile.albums[firstIndex],
+                second: profile.albums.indices.contains(secondIndex) ? profile.albums[secondIndex] : nil,
+                onSelected: { [weak self] in self?.onAlbumSelected?($0) },
+                onQueueRequested: { [weak self] in self?.onAlbumQueueRequested?($0) }
+            )
+            return cell
+        }
+    }
+
+    func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+        tableView.deselectRow(at: indexPath, animated: true)
+        guard sections[indexPath.section] == .tracks else { return }
+        onTrackSelected?(profile.tracks[indexPath.row])
+    }
+
+    func tableView(_ tableView: UITableView, didHighlightRowAt indexPath: IndexPath) {
+        guard sections[indexPath.section] == .tracks, let cell = tableView.cellForRow(at: indexPath) else { return }
+        InteractionMotion.setRow(cell, highlighted: true)
+    }
+
+    func tableView(_ tableView: UITableView, didUnhighlightRowAt indexPath: IndexPath) {
+        guard let cell = tableView.cellForRow(at: indexPath) else { return }
+        InteractionMotion.setRow(cell, highlighted: false)
+    }
 }
 
 private final class AlbumTrackCell: SongSwipeActionCell {
@@ -249,20 +345,25 @@ private final class HeaderActionButton: UIButton {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 }
 
-private final class ProfileCollectionHeader: UICollectionReusableView {
-    static let id = "ProfileCollectionHeader"
+private final class ProfileHeader: UIView {
     private let portrait = ArtworkView(image: nil, cornerRadius: 36)
-    private let title = ScreenPalette.label(font: .systemFont(ofSize: 27, weight: .bold))
-    private let stats = ScreenPalette.label(font: .systemFont(ofSize: 16), color: ScreenPalette.secondary)
+    private lazy var artworkLoader = DetailArtworkLoader(artworkView: portrait)
+    private let title = ScreenPalette.label(font: .systemFont(ofSize: 27, weight: .bold), lines: 2)
+    private let stats = ScreenPalette.label(font: .systemFont(ofSize: 16), color: ScreenPalette.secondary, lines: 2)
     private let info = ScreenPalette.label(font: .systemFont(ofSize: 15), color: ScreenPalette.secondary, lines: 2)
-    private let albums = ScreenPalette.label("Albums", font: .systemFont(ofSize: 23, weight: .bold))
 
-    override init(frame: CGRect) {
-        super.init(frame: frame)
-        [portrait, title, stats, info, albums].forEach(addSubview)
+    init(profile: ScreenProfile) {
+        super.init(frame: .zero)
+        accessibilityIdentifier = "profileDetail.header"
+        [portrait, title, stats, info].forEach(addSubview)
         title.textAlignment = .center
         stats.textAlignment = .center
         info.textAlignment = .center
+        title.text = profile.name
+        stats.text = profile.subtitle
+        info.text = profile.information
+        artworkLoader.configure(image: profile.artwork, url: profile.artworkURL)
+        artworkLoader.load(pointSize: 72)
         NSLayoutConstraint.activate([
             portrait.topAnchor.constraint(equalTo: topAnchor, constant: 16),
             portrait.centerXAnchor.constraint(equalTo: centerXAnchor),
@@ -277,29 +378,158 @@ private final class ProfileCollectionHeader: UICollectionReusableView {
             info.topAnchor.constraint(equalTo: stats.bottomAnchor, constant: 9),
             info.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 18),
             info.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -18),
-            albums.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
-            albums.bottomAnchor.constraint(equalTo: bottomAnchor)
+            info.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -16)
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+}
+
+private final class ProfileAlbumRowCell: UITableViewCell {
+    static let reuseID = "ProfileAlbumRow"
+    private let firstCard = ProfileAlbumCard()
+    private let secondCard = ProfileAlbumCard()
+
+    override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
+        super.init(style: style, reuseIdentifier: reuseIdentifier)
+        selectionStyle = .none
+        backgroundColor = DesignSystem.pageBackground
+        let row = UIStackView(arrangedSubviews: [firstCard, secondCard])
+        row.spacing = 16
+        row.distribution = .fillEqually
+        row.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(row)
+        NSLayoutConstraint.activate([
+            row.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 14),
+            row.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -14),
+            row.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 14),
+            row.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -10)
         ])
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    func configure(_ profile: ScreenProfile) {
-        portrait.image = profile.artwork
-        title.text = profile.name
-        stats.text = profile.subtitle
-        info.text = profile.information
+    override func prepareForReuse() {
+        super.prepareForReuse()
+        firstCard.configure(nil, onSelected: nil, onQueueRequested: nil)
+        secondCard.configure(nil, onSelected: nil, onQueueRequested: nil)
+    }
+
+    func configure(first: ScreenAlbum, second: ScreenAlbum?, onSelected: @escaping (ScreenAlbum) -> Void, onQueueRequested: @escaping (ScreenAlbum) -> Void) {
+        firstCard.configure(first, onSelected: onSelected, onQueueRequested: onQueueRequested)
+        secondCard.configure(second, onSelected: onSelected, onQueueRequested: onQueueRequested)
     }
 }
 
-private final class AlbumCardCellReuse: UICollectionViewCell {
-    static let id = "ProfileAlbumCard"
+private final class ProfileAlbumCard: UIView {
     private let art = ArtworkView(image: nil, cornerRadius: DesignSystem.albumArtworkCornerRadius)
+    private lazy var artworkLoader = DetailArtworkLoader(artworkView: art)
     private let title = ScreenPalette.label(font: .systemFont(ofSize: 16, weight: .semibold))
     private let meta = ScreenPalette.label(font: .systemFont(ofSize: 13), color: ScreenPalette.secondary)
-    override init(frame: CGRect) { super.init(frame: frame); let stack = UIStackView(arrangedSubviews: [art,title,meta]); stack.axis = .vertical; stack.spacing = 4; stack.translatesAutoresizingMaskIntoConstraints = false; contentView.addSubview(stack); NSLayoutConstraint.activate([stack.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),stack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),stack.topAnchor.constraint(equalTo: contentView.topAnchor),art.heightAnchor.constraint(equalTo: art.widthAnchor)]) }
+    private var album: ScreenAlbum?
+    private var onSelected: ((ScreenAlbum) -> Void)?
+    private var onQueueRequested: ((ScreenAlbum) -> Void)?
+
+    init() {
+        super.init(frame: .zero)
+        let stack = UIStackView(arrangedSubviews: [art, title, meta])
+        stack.axis = .vertical
+        stack.spacing = 4
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor),
+            stack.topAnchor.constraint(equalTo: topAnchor),
+            art.heightAnchor.constraint(equalTo: art.widthAnchor)
+        ])
+        let tap = UITapGestureRecognizer(target: self, action: #selector(selected))
+        let longPress = UILongPressGestureRecognizer(target: self, action: #selector(longPressed(_:)))
+        longPress.minimumPressDuration = 0.45
+        tap.require(toFail: longPress)
+        addGestureRecognizer(tap)
+        addGestureRecognizer(longPress)
+        isAccessibilityElement = true
+        accessibilityTraits = .button
+    }
+
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-    func configure(_ item: ScreenAlbum) { art.image = item.artwork; title.text = item.title; meta.text = item.year + " · " + String(item.tracks.count) + " tracks" }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        artworkLoader.load(pointSize: bounds.width)
+    }
+
+    func configure(_ album: ScreenAlbum?, onSelected: ((ScreenAlbum) -> Void)?, onQueueRequested: ((ScreenAlbum) -> Void)?) {
+        self.album = album
+        self.onSelected = onSelected
+        self.onQueueRequested = onQueueRequested
+        // Keep an empty second slot in odd rows, so the first card stays half-width.
+        alpha = album == nil ? 0 : 1
+        isUserInteractionEnabled = album != nil
+        accessibilityElementsHidden = album == nil
+        title.text = album?.title
+        let metadata = [album?.year ?? "", album.flatMap { $0.tracks.isEmpty ? nil : "\($0.tracks.count) tracks" } ?? ""]
+        meta.text = metadata.filter { !$0.isEmpty }.joined(separator: " · ")
+        accessibilityLabel = album.map { "\($0.title), \($0.artist)" }
+        artworkLoader.configure(image: album?.artwork, url: album?.artworkURL)
+        // Bounds are final after layout; do not guess a cache size from screen width.
+        setNeedsLayout()
+    }
+
+    @objc private func selected() {
+        guard let album = album else { return }
+        onSelected?(album)
+    }
+
+    @objc private func longPressed(_ recognizer: UILongPressGestureRecognizer) {
+        guard recognizer.state == .began, let album = album else { return }
+        onQueueRequested?(album)
+    }
+
+    override func accessibilityActivate() -> Bool {
+        guard album != nil else { return false }
+        selected()
+        return true
+    }
+}
+
+// Mirrors the pipeline's remote cache key, including the downsampled pixel size.
+// Each configuration/size change invalidates old completions, including A → B → A reuse.
+private final class DetailArtworkLoader {
+    private weak var artworkView: ArtworkView?
+    private var url: URL?
+    private var generation = UUID()
+    private var requestedKey: String?
+
+    init(artworkView: ArtworkView) { self.artworkView = artworkView }
+
+    func configure(image: UIImage?, url: URL?) {
+        generation = UUID()
+        requestedKey = nil
+        self.url = url
+        artworkView?.image = image
+    }
+
+    func load(pointSize: CGFloat) {
+        guard pointSize > 0, let url = url else { return }
+        let pixelSize = max(1, Int(ceil(pointSize * UIScreen.main.scale)))
+        let key = "remote|\(url.absoluteString)|\(pixelSize)"
+        guard requestedKey != key else { return }
+        generation = UUID()
+        requestedKey = key
+        if let image = ArtworkImagePipeline.shared.cachedImage(for: key) {
+            artworkView?.image = image
+            return
+        }
+        let generation = self.generation
+        ArtworkImagePipeline.shared.image(forRemoteURL: url, maximumPixelSize: pixelSize) { [weak self] image in
+            // The pipeline delivers every completion on the main queue.
+            guard let self = self, self.generation == generation,
+                  self.requestedKey == key, self.url == url, let image = image else { return }
+            self.artworkView?.image = image
+        }
+    }
 }
 
 private var controlClosureKey: UInt8 = 0

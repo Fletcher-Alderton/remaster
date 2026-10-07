@@ -68,8 +68,8 @@ The `release_type` alternatives above are separate calls, not a combined value: 
 ### Notes for the iOS app
 
 - Qobine uses one grouped `catalog/search` call, while the current iOS client fans out to `album/search`, `artist/search`, and `track/search`.
-- Qobine's discovery request is `discover/index`, not `album/getFeatured` / `artist/getFeatured`. It returns editorial containers rather than a standalone featured-artist endpoint. The iOS app's current approach of deriving artists from featured album artists avoids the unsupported call, but `discover/index` is the stronger reference for a fuller discovery page.
-- Qobine loads artist profiles with `artist/page` and separately requests release categories and similar artists. That response supplies portrait `hash`/`format` metadata; Qobine builds the portrait URL as described below.
+- Qobine's discovery request is `discover/index`, not `album/getFeatured` / `artist/getFeatured`. It returns editorial containers rather than a standalone featured-artist endpoint. The iOS app now uses `discover/index` for editorial sections, derives artist links from those album sections, and loads genre/tag-filtered playlists through `discover/playlists`.
+- Qobine loads artist profiles with `artist/page` and separately requests release categories and similar artists. The iOS app follows that profile path for artist details and album releases. The artist-page response supplies portrait `hash`/`format` metadata; Qobine builds the portrait URL as described below.
 
 ## Tracks and recommendations
 

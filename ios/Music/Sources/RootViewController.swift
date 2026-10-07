@@ -9,6 +9,9 @@ final class RootViewController: UIViewController {
     private var qobuzCatalogAlbumIDs: Set<String> = []
     private var qobuzAlbumTracksByID: [String: [ScreenTrack]] = [:]
     private var qobuzCatalogArtistIDByName: [String: String] = [:]
+    // Album headers must navigate to the primary album artist, not a track's
+    // performer (which can be a guest or compilation contributor).
+    private var qobuzPrimaryArtistByAlbumID: [String: (id: String, name: String)] = [:]
     private var playback: PlaybackControlling? { playbackBackendOverride ?? playbackBackend }
     private var queueState: QueueState { playback?.queueState ?? QueueState() }
     private let injectedPresentationTrackProvider: ((String) -> ScreenTrack?)?
@@ -329,13 +332,25 @@ final class RootViewController: UIViewController {
                 self.qobuzCatalogArtistIDByName[artist.name.lowercased()] = artist.id
                 self.showQobuzArtist(artist, credentials: credentials, from: catalog)
             }
+            catalog.onPlaylistSelected = { [weak self, weak catalog] playlist in
+                self?.showQobuzPlaylist(playlist, from: catalog)
+            }
             return catalog
-        case .albums, .artists:
+        case .albums, .artists, .tracks:
             guard let credentials = QobuzCredentialStore.shared.load() else {
                 return QobuzWelcomeViewController(onSignIn: { [weak self] in self?.showQobuzStreamTest(autoStartSignIn: true) })
             }
-            let mode: QobuzCatalogViewController.Mode = tab == .albums ? .albums : .artists
+            let mode: QobuzCatalogViewController.Mode
+            switch tab {
+            case .albums: mode = .albums
+            case .artists: mode = .artists
+            default: mode = .tracks
+            }
             let catalog = QobuzCatalogViewController(mode: mode, client: QobuzStreamingClient(credentials: credentials))
+            catalog.onTrackSelected = { [weak self] track in
+                self?.rememberQobuz(track)
+                self?.playQobuz(track: track, quality: QobuzPreferences.quality)
+            }
             catalog.onAlbumSelected = { [weak self, weak catalog] album in
                 guard let self = self else { return }
                 self.qobuzCatalogAlbumIDs.insert(album.id)
@@ -381,7 +396,7 @@ final class RootViewController: UIViewController {
 
     private func settingsItems() -> [SettingsTabItem] {
         let enabled = visibleTabs
-        return [LibraryTab.discover, .search, .albums, .artists].map { tab in
+        return [LibraryTab.discover, .search, .albums, .artists, .tracks].map { tab in
             SettingsTabItem(
                 id: tab.rawValue,
                 title: tab.title,
@@ -430,6 +445,9 @@ final class RootViewController: UIViewController {
         controller.onAlbumQueueRequested = { [weak self] album in
             self?.showAlbumQueueMenu(for: album)
         }
+        controller.onTrackSelected = { [weak self] track in self?.start(track: track) }
+        controller.onTrackNavigationRequested = { [weak self] track in self?.showTrackNavigationMenu(for: track) }
+        controller.onSongSwipeAction = { [weak self] track, action in self?.handleSongSwipe(action, track: track) }
         InteractionMotion.present(controller, from: presentingController ?? self)
     }
 
@@ -788,6 +806,7 @@ final class RootViewController: UIViewController {
 
     private func rememberQobuz(profile: ScreenProfile) {
         qobuzCatalogArtistIDByName[profile.name.lowercased()] = profile.id
+        profile.tracks.forEach(rememberQobuz)
         profile.albums.forEach { album in
             qobuzCatalogAlbumIDs.insert(album.id)
             album.tracks.forEach(rememberQobuz)
@@ -795,7 +814,8 @@ final class RootViewController: UIViewController {
     }
 
     private func showQobuzAlbum(_ album: ScreenAlbum, credentials: QobuzCredentials, from presentingController: UIViewController? = nil) {
-        if !album.tracks.isEmpty,
+        if qobuzPrimaryArtistByAlbumID[album.id] != nil,
+           !album.tracks.isEmpty,
            album.tracks.allSatisfy({ $0.catalogAlbumID == album.id || qobuzPresentationTracks[$0.id] != nil }) {
             presentQobuzAlbum(album, from: presentingController)
             return
@@ -808,6 +828,13 @@ final class RootViewController: UIViewController {
                 case .failure(let error):
                     self.showCatalogError(error)
                 case .success(let detail):
+                    // This association exists even when the album has no tracks.
+                    // Never infer the album artist from the first track performer.
+                    if let primaryArtist = detail.artist, !primaryArtist.id.isEmpty {
+                        self.qobuzPrimaryArtistByAlbumID[detail.id] = (primaryArtist.id, primaryArtist.name)
+                    } else {
+                        self.qobuzPrimaryArtistByAlbumID.removeValue(forKey: detail.id)
+                    }
                     let mapped = QobuzCatalogMapper.album(detail)
                     let artwork = detail.artworkURL.flatMap { ArtworkImagePipeline.shared.cachedImage(for: $0.absoluteString) }
                     let tracks = mapped.tracks.map { track in
@@ -857,11 +884,11 @@ final class RootViewController: UIViewController {
         controller.onTrackNavigationRequested = { [weak self] track in self?.showTrackNavigationMenu(for: track) }
         controller.onSongSwipeAction = { [weak self] track, action in self?.handleSongSwipe(action, track: track) }
         controller.onAlbumQueueRequested = { [weak self] selectedAlbum in self?.showAlbumQueueMenu(for: selectedAlbum) }
-        controller.onArtistSelected = { [weak self, weak controller] artistName in
+        controller.onArtistSelected = { [weak self, weak controller] _ in
             guard let self = self,
-                  let artistID = self.qobuzCatalogArtistIDByName[artistName.lowercased()],
+                  let primaryArtist = self.qobuzPrimaryArtistByAlbumID[album.id],
                   let credentials = QobuzCredentialStore.shared.load() else { return }
-            self.showQobuzArtist(ScreenProfile(id: artistID, name: artistName, subtitle: "Qobuz artist", information: "", albums: []), credentials: credentials, from: controller)
+            self.showQobuzArtist(ScreenProfile(id: primaryArtist.id, name: primaryArtist.name, subtitle: "Qobuz artist", information: "", albums: []), credentials: credentials, from: controller)
         }
         controller.onPlayAlbum = { [weak self] tracks, shuffle in
             guard let self = self else { return }
@@ -869,6 +896,24 @@ final class RootViewController: UIViewController {
             guard !ordered.isEmpty else { return }
             ordered.forEach(self.rememberQobuz)
             self.playQobuz(tracks: ordered, startingAt: 0, quality: QobuzPreferences.quality)
+        }
+        InteractionMotion.present(controller, from: presentingController ?? self)
+    }
+
+    private func showQobuzPlaylist(_ playlist: QobuzCatalogPlaylist, from presentingController: UIViewController? = nil) {
+        let controller = QobuzPlaylistDetailViewController(playlist: playlist)
+        controller.modalPresentationStyle = .fullScreen
+        controller.onTrackSelected = { [weak self] track in
+            guard let self = self else { return }
+            self.rememberQobuz(track)
+            self.playQobuz(track: track, quality: QobuzPreferences.quality)
+        }
+        controller.onPlayRequested = { [weak self] tracks, shuffle in
+            guard let self = self else { return }
+            let orderedTracks = shuffle ? tracks.shuffled() : tracks
+            guard !orderedTracks.isEmpty else { return }
+            orderedTracks.forEach(self.rememberQobuz)
+            self.playQobuz(tracks: orderedTracks, startingAt: 0, quality: QobuzPreferences.quality)
         }
         InteractionMotion.present(controller, from: presentingController ?? self)
     }

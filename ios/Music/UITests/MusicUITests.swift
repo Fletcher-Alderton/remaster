@@ -12,10 +12,10 @@ final class MusicUITests: XCTestCase {
     }
 
     func testOnlyQobuzTabsAreVisibleByDefault() {
-        for tab in ["discover", "search", "albums", "artists"] {
+        for tab in ["discover", "search", "albums", "artists", "tracks"] {
             XCTAssertTrue(app.buttons["tab.\(tab)"].waitForExistence(timeout: 3))
         }
-        for legacyTab in ["tracks", "playlists", "genres"] {
+        for legacyTab in ["playlists", "genres"] {
             XCTAssertFalse(app.buttons["tab.\(legacyTab)"].exists)
         }
         XCTAssertFalse(app.buttons["miniPlayer.open"].exists)
@@ -31,8 +31,9 @@ final class MusicUITests: XCTestCase {
         XCTAssertFalse(app.staticTexts["Import Music"].exists)
 
         let tabRows = app.tables.cells
-        XCTAssertEqual(tabRows.count, 4)
-        for legacyTitle in ["Tracks", "Playlists", "Genres"] {
+        XCTAssertEqual(tabRows.count, 5)
+        XCTAssertTrue(tabRows.containing(.staticText, identifier: "Tracks").firstMatch.exists)
+        for legacyTitle in ["Playlists", "Genres"] {
             XCTAssertFalse(tabRows.containing(.staticText, identifier: legacyTitle).firstMatch.exists)
         }
     }

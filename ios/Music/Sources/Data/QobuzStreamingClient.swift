@@ -43,24 +43,41 @@ struct QobuzSearchTrack: Codable {
 
         init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
-            name = try container.decodeIfPresent(String.self, forKey: .name)
+            if let direct = try? container.decode(String.self, forKey: .name) { name = direct }
+            else { name = try container.decodeIfPresent(DisplayName.self, forKey: .name)?.display }
             if let value = try? container.decode(String.self, forKey: .id) { id = value }
             else if let value = try? container.decode(Int64.self, forKey: .id) { id = String(value) }
             else { id = nil }
         }
     }
 
+    private struct DisplayName: Decodable { let display: String? }
+
     struct Image: Codable {
         let small: String?
         let thumbnail: String?
         let large: String?
+        let medium: String?
         let extraLarge: String?
+        let mega: String?
 
         enum CodingKeys: String, CodingKey {
-            case small
-            case thumbnail
-            case large
-            case extraLarge = "extaLarge"
+            case small, thumbnail, large, medium, mega
+            case extraLarge = "extralarge"
+        }
+        private enum AlternateKeys: String, CodingKey { case extraLarge, extaLarge }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            let alternates = try decoder.container(keyedBy: AlternateKeys.self)
+            small = try container.decodeIfPresent(String.self, forKey: .small)
+            thumbnail = try container.decodeIfPresent(String.self, forKey: .thumbnail)
+            large = try container.decodeIfPresent(String.self, forKey: .large)
+            medium = try container.decodeIfPresent(String.self, forKey: .medium)
+            mega = try container.decodeIfPresent(String.self, forKey: .mega)
+            extraLarge = try container.decodeIfPresent(String.self, forKey: .extraLarge)
+                ?? alternates.decodeIfPresent(String.self, forKey: .extraLarge)
+                ?? alternates.decodeIfPresent(String.self, forKey: .extaLarge)
         }
     }
 
@@ -68,49 +85,65 @@ struct QobuzSearchTrack: Codable {
         let id: String?
         let title: String?
         let image: Image?
+        let artist: Performer?
 
-        enum CodingKeys: String, CodingKey { case id, title, image }
+        enum CodingKeys: String, CodingKey { case id, title, image, artist }
 
         init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             title = try container.decodeIfPresent(String.self, forKey: .title)
             image = try container.decodeIfPresent(Image.self, forKey: .image)
+            artist = try container.decodeIfPresent(Performer.self, forKey: .artist)
             if let value = try? container.decode(String.self, forKey: .id) { id = value }
             else if let value = try? container.decode(Int64.self, forKey: .id) { id = String(value) }
             else { id = nil }
         }
 
         var imageURL: URL? {
-            [image?.extraLarge, image?.large, image?.thumbnail, image?.small]
-                .compactMap { $0 }
-                .compactMap(URL.init(string:))
-                .first { $0.scheme?.lowercased() == "https" }
+            [image?.mega, image?.extraLarge, image?.large, image?.medium, image?.thumbnail, image?.small].catalogArtworkURL
         }
     }
 
-        let id: Int64
-        let title: String
-        let duration: Int?
-        let performer: Performer?
-        let album: Album?
-        let albumID: String?
+    let id: Int64
+    let title: String
+    let duration: Int?
+    let performer: Performer?
+    let album: Album?
+    let albumID: String?
+    let streamable: Bool?
 
-        enum CodingKeys: String, CodingKey { case id, title, duration, performer, album, albumID = "album_id" }
+    enum CodingKeys: String, CodingKey {
+        case id, title, duration, performer, album, streamable
+        case albumID = "album_id"
+    }
+    private enum ModernKeys: String, CodingKey { case artist, rights }
+    private struct Rights: Decodable { let streamable: Bool? }
 
-        init(from decoder: Decoder) throws {
-            let container = try decoder.container(keyedBy: CodingKeys.self)
-            id = try container.decode(Int64.self, forKey: .id)
-            title = try container.decode(String.self, forKey: .title)
-            duration = try container.decodeIfPresent(Int.self, forKey: .duration)
-            performer = try container.decodeIfPresent(Performer.self, forKey: .performer)
-            album = try container.decodeIfPresent(Album.self, forKey: .album)
-            if let stringID = try? container.decode(String.self, forKey: .albumID) { albumID = stringID }
-            else if let numericID = try? container.decode(Int64.self, forKey: .albumID) { albumID = String(numericID) }
-            else { albumID = nil }
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let modern = try decoder.container(keyedBy: ModernKeys.self)
+        if let numericID = try? container.decode(Int64.self, forKey: .id) { id = numericID }
+        else {
+            let stringID = try container.decode(String.self, forKey: .id)
+            guard let numericID = Int64(stringID) else {
+                throw DecodingError.dataCorruptedError(forKey: .id, in: container, debugDescription: "Expected a numeric track ID.")
+            }
+            id = numericID
         }
+        title = try container.decode(String.self, forKey: .title)
+        duration = try container.decodeIfPresent(Int.self, forKey: .duration)
+        performer = try container.decodeIfPresent(Performer.self, forKey: .performer)
+            ?? modern.decodeIfPresent(Performer.self, forKey: .artist)
+        album = try container.decodeIfPresent(Album.self, forKey: .album)
+        if let stringID = try? container.decode(String.self, forKey: .albumID) { albumID = stringID }
+        else if let numericID = try? container.decode(Int64.self, forKey: .albumID) { albumID = String(numericID) }
+        else { albumID = nil }
+        streamable = try container.decodeIfPresent(Bool.self, forKey: .streamable)
+            ?? modern.decodeIfPresent(Rights.self, forKey: .rights)?.streamable
+    }
 
-        var subtitle: String {
-        [performer?.name, album?.title].compactMap { $0 }.joined(separator: " • ")
+    var subtitle: String {
+        [performer?.name ?? album?.artist?.name, album?.title].compactMap { $0 }.joined(separator: " • ")
     }
 }
 
@@ -455,11 +488,15 @@ final class QobuzStreamingClient: QobuzStreamResolving {
     private let credentials: QobuzCredentials
     private let session: URLSession
     private let resolutionTimeout: TimeInterval
+    private let catalogAppID: String?
 
-    init(credentials: QobuzCredentials, session: URLSession = .shared, resolutionTimeout: TimeInterval = 45) {
+    /// Supplying a catalog app ID allows isolated URLProtocol tests without changing the player cache.
+    /// Normal app callers leave it nil and discover the current web-player configuration.
+    init(credentials: QobuzCredentials, session: URLSession = .shared, resolutionTimeout: TimeInterval = 45, catalogAppID: String? = nil) {
         self.credentials = credentials
         self.session = session
         self.resolutionTimeout = resolutionTimeout
+        self.catalogAppID = catalogAppID
     }
 
     static func authorizationURL(appID: String) -> URL? {
@@ -600,25 +637,147 @@ final class QobuzStreamingClient: QobuzStreamResolving {
         }
     }
 
-    func featuredCatalog(completion: @escaping (Result<QobuzCatalogFeaturedResponse, Error>) -> Void) {
+    func catalogGenres(completion: @escaping (Result<[QobuzCatalogGenre], Error>) -> Void) {
         discoverWebPlayer { result in
             switch result {
             case .failure(let error): completion(.failure(error))
             case .success(let playerInfo):
-                self.performCatalogRequest(path: "album/getFeatured", queryItems: [
-                    URLQueryItem(name: "type", value: "new-releases"),
-                    URLQueryItem(name: "limit", value: "25")
-                ], appID: playerInfo.appID) { albumResult in
-                    switch albumResult {
-                    case .failure(let error): completion(.failure(error))
-                    case .success(let albumData):
+                self.performCatalogRequest(path: "genre/list", queryItems: [], appID: playerInfo.appID) { result in
+                    completion(result.flatMap { data in
+                        Result {
+                            try JSONDecoder().decode(QobuzCatalogGenreListResponse.self, from: data).genres?.items ?? []
+                        }
+                    })
+                }
+            }
+        }
+    }
+
+    func discoveryIndex(genreID: String?, completion: @escaping (Result<QobuzCatalogDiscoveryResponse, Error>) -> Void) {
+        discoverWebPlayer { result in
+            switch result {
+            case .failure(let error): completion(.failure(error))
+            case .success(let playerInfo):
+                self.performCatalogRequest(path: "discover/index", queryItems: [
+                    URLQueryItem(name: "genre_ids", value: genreID ?? "")
+                ], appID: playerInfo.appID) { result in
+                    completion(result.flatMap { data in
+                        Result { try JSONDecoder().decode(QobuzCatalogDiscoveryResponse.self, from: data) }
+                    })
+                }
+            }
+        }
+    }
+
+    func discoverPlaylists(
+        genreID: String?,
+        tag: String?,
+        offset: Int,
+        limit: Int = 20,
+        completion: @escaping (Result<QobuzCatalogPlaylistsResponse, Error>) -> Void
+    ) {
+        discoverWebPlayer { result in
+            switch result {
+            case .failure(let error): completion(.failure(error))
+            case .success(let playerInfo):
+                self.performCatalogRequest(path: "discover/playlists", queryItems: [
+                    URLQueryItem(name: "genre_ids", value: genreID ?? ""),
+                    URLQueryItem(name: "tags", value: tag ?? ""),
+                    URLQueryItem(name: "offset", value: String(max(0, offset))),
+                    URLQueryItem(name: "limit", value: String(min(max(1, limit), 100)))
+                ], appID: playerInfo.appID) { result in
+                    completion(result.flatMap { data in
+                        Result { try JSONDecoder().decode(QobuzCatalogPlaylistsResponse.self, from: data) }
+                    })
+                }
+            }
+        }
+    }
+
+    func playlist(id: String, completion: @escaping (Result<QobuzCatalogPlaylist, Error>) -> Void) {
+        discoverWebPlayer { result in
+            switch result {
+            case .failure(let error): completion(.failure(error))
+            case .success(let playerInfo):
+                self.performCatalogRequest(path: "playlist/get", queryItems: [
+                    URLQueryItem(name: "limit", value: "500"),
+                    URLQueryItem(name: "extra", value: "tracks"),
+                    URLQueryItem(name: "playlist_id", value: id),
+                    URLQueryItem(name: "offset", value: "0")
+                ], appID: playerInfo.appID) { result in
+                    completion(result.flatMap { data in
+                        Result { try JSONDecoder().decode(QobuzCatalogPlaylist.self, from: data) }
+                    })
+                }
+            }
+        }
+    }
+
+    func featuredCatalog(completion: @escaping (Result<QobuzCatalogFeaturedResponse, Error>) -> Void) {
+        discoveryIndex(genreID: nil) { result in
+            switch result {
+            case .failure(let error): completion(.failure(error))
+            case .success(let response):
+                let section = response.containers?.newReleases?.data
+                let albumPage = section.map { page in
+                    QobuzCatalogPage(
+                        items: page.items.map(QobuzCatalogMapper.catalogAlbum),
+                        total: page.total
+                    )
+                }
+                let artistPage = QobuzCatalogMapper.featuredArtists(from: albumPage)
+                completion(.success(QobuzCatalogFeaturedResponse(albums: albumPage, artists: artistPage)))
+            }
+        }
+    }
+
+    /// One authenticated favorites endpoint supplies all three saved-library groups.
+    /// Qobine requests limit=1000; each group also reports its own offset/limit/total.
+    func library(completion: @escaping (Result<QobuzCatalogLibraryResponse, Error>) -> Void) {
+        guard !credentials.userAuthToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            completion(.failure(QobuzStreamingError.notAuthenticated))
+            return
+        }
+        discoverCatalogAppID { result in
+            switch result {
+            case .failure(let error): completion(.failure(error))
+            case .success(let appID):
+                var albums = QobuzCatalogAccumulator<QobuzCatalogAlbum>()
+                var artists = QobuzCatalogAccumulator<QobuzCatalogArtist>()
+                var tracks = QobuzCatalogAccumulator<QobuzSearchTrack>()
+                func load(offset: Int) {
+                    self.performCatalogRequest(path: "favorite/getUserFavorites", queryItems: [
+                        URLQueryItem(name: "limit", value: "1000"),
+                        URLQueryItem(name: "offset", value: String(offset))
+                    ], appID: appID) { result in
                         do {
-                            let albumPage = try JSONDecoder().decode(QobuzCatalogFeaturedResponse.self, from: albumData).albums
-                            let artistPage = QobuzCatalogMapper.featuredArtists(from: albumPage)
-                            completion(.success(QobuzCatalogFeaturedResponse(albums: albumPage, artists: artistPage)))
+                            let response = try JSONDecoder().decode(QobuzCatalogLibraryResponse.self, from: result.get())
+                            guard response.albums != nil || response.artists != nil || response.tracks != nil else {
+                                throw QobuzStreamingError.invalidResponse
+                            }
+                            // Missing groups on the first page are legitimately empty. A missing
+                            // unfinished group on a later page is not a complete saved library.
+                            try albums.append(response.albums, requestedOffset: offset, requestedLimit: 1000, id: { $0.id })
+                            try artists.append(response.artists, requestedOffset: offset, requestedLimit: 1000, id: { $0.id })
+                            let trackPage = response.tracks.map {
+                                QobuzCatalogPage(items: $0.items, total: $0.total, offset: $0.offset, limit: $0.limit, hasMore: $0.hasMore)
+                            }
+                            try tracks.append(trackPage, requestedOffset: offset, requestedLimit: 1000, id: { String($0.id) })
+                            let pending = [albums.pendingOffset, artists.pendingOffset, tracks.pendingOffset].compactMap { $0 }
+                            if let nextOffset = pending.min() {
+                                guard nextOffset > offset else { throw QobuzStreamingError.api("Qobuz favorites pagination did not advance.") }
+                                load(offset: nextOffset)
+                            } else {
+                                completion(.success(QobuzCatalogLibraryResponse(
+                                    albums: QobuzCatalogPage(items: albums.items, total: albums.items.count),
+                                    artists: QobuzCatalogPage(items: artists.items, total: artists.items.count),
+                                    tracks: QobuzCatalogTrackPage(items: tracks.items, total: tracks.items.count)
+                                )))
+                            }
                         } catch { completion(.failure(error)) }
                     }
                 }
+                load(offset: 0)
             }
         }
     }
@@ -639,19 +798,82 @@ final class QobuzStreamingClient: QobuzStreamResolving {
     }
 
     func artist(id: String, completion: @escaping (Result<QobuzCatalogArtist, Error>) -> Void) {
-        discoverWebPlayer { result in
+        discoverCatalogAppID { result in
             switch result {
             case .failure(let error): completion(.failure(error))
-            case .success(let playerInfo):
-                self.performCatalogRequest(path: "artist/get", queryItems: [
+            case .success(let appID):
+                self.performCatalogRequest(path: "artist/page", queryItems: [
                     URLQueryItem(name: "artist_id", value: id),
-                    URLQueryItem(name: "extra", value: "albums"),
-                    URLQueryItem(name: "limit", value: "50")
-                ], appID: playerInfo.appID) { result in
-                    completion(result.flatMap { data in Result { try JSONDecoder().decode(QobuzCatalogArtist.self, from: data) } })
+                    URLQueryItem(name: "app_id", value: appID),
+                    URLQueryItem(name: "sort", value: "relevant")
+                ], appID: appID) { pageResult in
+                    switch pageResult {
+                    case .failure(let error): completion(.failure(error))
+                    case .success(let pageData):
+                        do {
+                            let page = try JSONDecoder().decode(QobuzCatalogArtistPage.self, from: pageData)
+                            self.loadArtistReleases(id: id, appID: appID) { releases, warning in
+                                completion(.success(QobuzCatalogMapper.artistPage(page, releases: releases, releasesError: warning)))
+                            }
+                        } catch {
+                            completion(.failure(error))
+                        }
+                    }
                 }
             }
         }
+    }
+
+    private func discoverCatalogAppID(completion: @escaping (Result<String, Error>) -> Void) {
+        if let appID = catalogAppID { completion(.success(appID)); return }
+        discoverWebPlayer { result in completion(result.map { $0.appID }) }
+    }
+
+    private func loadArtistReleases(
+        id: String,
+        appID: String,
+        completion: @escaping (QobuzCatalogPage<QobuzCatalogDiscoveryAlbum>?, String?) -> Void
+    ) {
+        let categories = ["album", "epSingle", "live", "compilation"]
+        var releases: [QobuzCatalogDiscoveryAlbum] = []
+        var seen = Set<String>()
+        var failedCategories: [String] = []
+        func loadCategory(_ index: Int) {
+            guard index < categories.count else {
+                let warning = failedCategories.isEmpty ? nil
+                    : "Some artist releases could not be loaded (\(failedCategories.joined(separator: ", ")))."
+                completion(QobuzCatalogPage(items: releases, total: warning == nil ? releases.count : nil), warning)
+                return
+            }
+            let category = categories[index]
+            var accumulator = QobuzCatalogAccumulator<QobuzCatalogDiscoveryAlbum>()
+            func finishCategory(failed: Bool) {
+                releases += accumulator.items.filter { seen.insert($0.id).inserted }
+                if failed { failedCategories.append(category) }
+                loadCategory(index + 1)
+            }
+            func loadPage(offset: Int) {
+                self.performCatalogRequest(path: "artist/getReleasesList", queryItems: [
+                    URLQueryItem(name: "artist_id", value: id),
+                    URLQueryItem(name: "limit", value: "100"),
+                    URLQueryItem(name: "release_type", value: category),
+                    URLQueryItem(name: "sort", value: "release_date"),
+                    URLQueryItem(name: "offset", value: String(offset)),
+                    URLQueryItem(name: "track_size", value: "1")
+                ], appID: appID) { result in
+                    do {
+                        // Actual Qobine ReleaseQuery is {has_more, items}, not {albums: ...}.
+                        let page = try JSONDecoder().decode(QobuzCatalogPage<QobuzCatalogDiscoveryAlbum>.self, from: result.get())
+                        try accumulator.append(page, requestedOffset: offset, requestedLimit: 100, id: { $0.id })
+                        if let nextOffset = accumulator.pendingOffset {
+                            loadPage(offset: nextOffset)
+                        } else { finishCategory(failed: false) }
+                    } catch { finishCategory(failed: true) }
+                }
+            }
+            loadPage(offset: 0)
+        }
+        loadCategory(0)
     }
 
     private func performCatalogRequest(
@@ -665,7 +887,11 @@ final class QobuzStreamingClient: QobuzStreamResolving {
         var request = URLRequest(url: components.url!)
         request.timeoutInterval = Self.requestTimeout
         request.setValue(appID, forHTTPHeaderField: "X-App-Id")
-        request.setValue(credentials.userAuthToken, forHTTPHeaderField: "X-User-Auth-Token")
+        if credentials.userAuthToken.filter({ $0 == "." }).count == 3 {
+            request.setValue("Bearer " + credentials.userAuthToken, forHTTPHeaderField: "Authorization")
+        } else {
+            request.setValue(credentials.userAuthToken, forHTTPHeaderField: "X-User-Auth-Token")
+        }
         session.dataTask(with: request) { data, response, error in
             if let error = error { completion(.failure(error)); return }
             guard let data = data, let http = response as? HTTPURLResponse else {
@@ -1078,5 +1304,48 @@ final class QobuzStreamingClient: QobuzStreamResolving {
         var digest = [UInt8](repeating: 0, count: Int(CC_MD5_DIGEST_LENGTH))
         _ = CC_MD5(bytes, CC_LONG(bytes.count), &digest)
         return digest.map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+/// Tracks progress by actual returned item count, not the requested limit (the API may cap it).
+/// Refuse a stuck/truncated server page instead of returning an apparently complete library.
+private struct QobuzCatalogAccumulator<Item: Decodable> {
+    private(set) var items: [Item] = []
+    private var seen = Set<String>()
+    private var done = false
+    private var nextOffset = 0
+    var pendingOffset: Int? { done ? nil : nextOffset }
+
+    mutating func append(
+        _ page: QobuzCatalogPage<Item>?,
+        requestedOffset: Int,
+        requestedLimit: Int,
+        id: (Item) -> String
+    ) throws {
+        guard !done else { return }
+        guard let page = page else {
+            guard requestedOffset == 0 else { throw QobuzStreamingError.api("Qobuz omitted an unfinished catalog page.") }
+            done = true
+            return
+        }
+        if let returnedOffset = page.offset, returnedOffset != requestedOffset {
+            throw QobuzStreamingError.api("Qobuz did not honor the catalog pagination offset.")
+        }
+        let newItems = page.items.filter { seen.insert(id($0)).inserted }
+        let endOffset = requestedOffset + page.items.count
+        let more: Bool
+        if let hasMore = page.hasMore { more = hasMore }
+        else if let total = page.total { more = endOffset < total }
+        else { more = page.items.count >= max(1, page.limit ?? requestedLimit) }
+        guard !more || (!newItems.isEmpty && endOffset > nextOffset) else {
+            throw QobuzStreamingError.api("Qobuz catalog pagination stopped before all items were returned.")
+        }
+        // Even a terminal repeated page must not silently claim the library is complete.
+        guard requestedOffset == 0 || page.items.isEmpty || !newItems.isEmpty else {
+            throw QobuzStreamingError.api("Qobuz returned a repeated catalog page.")
+        }
+        items += newItems
+        nextOffset = endOffset
+        done = !more
     }
 }

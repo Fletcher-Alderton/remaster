@@ -51,10 +51,11 @@ struct ScreenProfile {
     let artwork: UIImage?
     let artworkURL: URL?
     let albums: [ScreenAlbum]
+    let tracks: [ScreenTrack]
 
-    init(id: String, name: String, subtitle: String, information: String, artwork: UIImage? = nil, artworkURL: URL? = nil, albums: [ScreenAlbum] = []) {
+    init(id: String, name: String, subtitle: String, information: String, artwork: UIImage? = nil, artworkURL: URL? = nil, albums: [ScreenAlbum] = [], tracks: [ScreenTrack] = []) {
         self.id = id; self.name = name; self.subtitle = subtitle; self.information = information
-        self.artwork = artwork; self.artworkURL = artworkURL; self.albums = albums
+        self.artwork = artwork; self.artworkURL = artworkURL; self.albums = albums; self.tracks = tracks
     }
 }
 
