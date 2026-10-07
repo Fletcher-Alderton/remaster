@@ -31,6 +31,7 @@ final class RootViewController: UIViewController {
 
     private let tabStrip = TabStripView()
     private let contentView = UIView()
+    private var edgeTabSwipeCoordinator: EdgeTabSwipeCoordinator?
     private let miniPlayer = MiniPlayerView()
     private var activeController: UIViewController?
     private var tabControllers: [LibraryTab: UIViewController] = [:]
@@ -39,6 +40,13 @@ final class RootViewController: UIViewController {
 
     private var renderedQueueTrackIDs: [String] = []
     private var renderedQueueCurrentIndex: Int?
+    private var qobuzPresentationRevision = 0
+    private var renderedQueuePresentationRevision = 0
+    // Only the current player cover is retained here. All other remote images
+    // belong to the bounded pipeline cache or to displayed queue image views.
+    private var currentArtworkRequestKey: String?
+    private var currentArtworkGeneration = UUID()
+    private var currentArtwork: UIImage?
     private var settingsReturnTab: LibraryTab = .albums
 
     override var prefersStatusBarHidden: Bool { return true }
@@ -70,6 +78,10 @@ final class RootViewController: UIViewController {
 
     private var visibleTabs: [LibraryTab] {
         return appState.tabConfiguration.enabledTabs
+    }
+
+    private var isDisplayingSettings: Bool {
+        return activeController is SettingsViewController
     }
 
     private func buildRootView() {
@@ -109,9 +121,13 @@ final class RootViewController: UIViewController {
         }
         appState.updateQueueState(controller.queueState)
         controller.onStateChange = { [weak self] queue in
-            guard let self = self else { return }
-            self.appState.updateQueueState(queue)
-            self.updatePlaybackViews(queue: queue)
+            let update = { [weak self] in
+                guard let self = self else { return }
+                self.appState.updateQueueState(queue)
+                self.updatePlaybackViews(queue: queue)
+            }
+            if Thread.isMainThread { update() }
+            else { DispatchQueue.main.async(execute: update) }
         }
         updatePlaybackViews(queue: controller.queueState)
     }
@@ -129,7 +145,7 @@ final class RootViewController: UIViewController {
                 }
             }
             qobuzBackend.onStreamResolved = { [weak self] trackID, requestedQuality, stream in
-                guard let root = self, root.qobuzPresentationTracks[trackID] != nil else { return }
+                guard let root = self else { return }
                 let actualQuality = QobuzStreamQuality(rawValue: stream.formatID)
                 guard actualQuality != nil else {
                     DispatchQueue.main.async {
@@ -148,6 +164,7 @@ final class RootViewController: UIViewController {
                 }
                 DispatchQueue.main.async {
                     guard let current = root.qobuzPresentationTracks[trackID] else { return }
+                    if current.quality != status { root.qobuzPresentationRevision += 1 }
                     root.qobuzPresentationTracks[trackID] = ScreenTrack(
                         id: current.id,
                         title: current.title,
@@ -165,10 +182,12 @@ final class RootViewController: UIViewController {
                 }
             }
             qobuzBackend.onError = { [weak self] error in
-                guard let root = self else { return }
-                let alert = UIAlertController(title: "Qobuz Playback Error", message: error.localizedDescription, preferredStyle: .alert)
-                alert.addAction(UIAlertAction(title: "OK", style: .default))
-                root.topPresentedController().present(alert, animated: true)
+                DispatchQueue.main.async {
+                    guard let root = self else { return }
+                    let alert = UIAlertController(title: "Qobuz Playback Error", message: error.localizedDescription, preferredStyle: .alert)
+                    alert.addAction(UIAlertAction(title: "OK", style: .default))
+                    root.topPresentedController().present(alert, animated: true)
+                }
             }
         }
         configurePlaybackState()
@@ -182,6 +201,17 @@ final class RootViewController: UIViewController {
         }
         miniPlayer.onTogglePlayback = { [weak self] in self?.playback?.togglePlayPause() }
         miniPlayer.onOpenPlayer = { [weak self] in self?.openPlayer() }
+        edgeTabSwipeCoordinator = EdgeTabSwipeCoordinator(
+            view: contentView,
+            canNavigate: { [weak self] in
+                guard let self = self else { return false }
+                // Settings owns its left-edge return gesture. Modal detail,
+                // account, player and queue screens must not move root tabs.
+                return !self.isDisplayingSettings && self.appState.currentTab != .settings && self.activeController != nil &&
+                    self.presentedViewController == nil && self.activeController?.presentedViewController == nil
+            },
+            onSwipe: { [weak self] forward in self?.navigateBySwipe(forward: forward) }
+        )
     }
 
     @objc private func themeDidChange() {
@@ -312,59 +342,64 @@ final class RootViewController: UIViewController {
 
     private func makeLibraryController(tab: LibraryTab) -> UIViewController {
         switch tab {
-        case .discover, .search:
-            guard let credentials = QobuzCredentialStore.shared.load() else {
-                return QobuzWelcomeViewController(onSignIn: { [weak self] in self?.showQobuzStreamTest(autoStartSignIn: true) })
-            }
-            let mode: QobuzCatalogViewController.Mode = tab == .discover ? .discover : .search
-            let catalog = QobuzCatalogViewController(mode: mode, client: QobuzStreamingClient(credentials: credentials))
-            catalog.onTrackSelected = { [weak self] track in
-                self?.rememberQobuz(track)
-                self?.playQobuz(track: track, quality: QobuzPreferences.quality)
-            }
-            catalog.onAlbumSelected = { [weak self, weak catalog] album in
-                guard let self = self else { return }
-                self.qobuzCatalogAlbumIDs.insert(album.id)
-                self.showQobuzAlbum(album, credentials: credentials, from: catalog)
-            }
-            catalog.onArtistSelected = { [weak self, weak catalog] artist in
-                guard let self = self else { return }
-                self.qobuzCatalogArtistIDByName[artist.name.lowercased()] = artist.id
-                self.showQobuzArtist(artist, credentials: credentials, from: catalog)
-            }
-            catalog.onPlaylistSelected = { [weak self, weak catalog] playlist in
-                self?.showQobuzPlaylist(playlist, from: catalog)
-            }
-            return catalog
-        case .albums, .artists, .tracks:
+        case .discover, .search, .albums, .artists, .tracks:
             guard let credentials = QobuzCredentialStore.shared.load() else {
                 return QobuzWelcomeViewController(onSignIn: { [weak self] in self?.showQobuzStreamTest(autoStartSignIn: true) })
             }
             let mode: QobuzCatalogViewController.Mode
             switch tab {
+            case .discover: mode = .discover
+            case .search: mode = .search
             case .albums: mode = .albums
             case .artists: mode = .artists
             default: mode = .tracks
             }
             let catalog = QobuzCatalogViewController(mode: mode, client: QobuzStreamingClient(credentials: credentials))
-            catalog.onTrackSelected = { [weak self] track in
-                self?.rememberQobuz(track)
-                self?.playQobuz(track: track, quality: QobuzPreferences.quality)
-            }
-            catalog.onAlbumSelected = { [weak self, weak catalog] album in
-                guard let self = self else { return }
-                self.qobuzCatalogAlbumIDs.insert(album.id)
-                self.showQobuzAlbum(album, credentials: credentials, from: catalog)
-            }
-            catalog.onArtistSelected = { [weak self, weak catalog] artist in
-                guard let self = self else { return }
-                self.qobuzCatalogArtistIDByName[artist.name.lowercased()] = artist.id
-                self.showQobuzArtist(artist, credentials: credentials, from: catalog)
-            }
+            configureCatalogActions(catalog, credentials: credentials)
             return catalog
-
         case .settings:
             return makeSettingsController()
+        }
+    }
+
+    /// All catalog modes share registration and action routing. In particular,
+    /// selection already carries the catalog's sorted/filtered suffix; do not
+    /// replace it with the album cache or the catalog's unfiltered track list.
+    private func configureCatalogActions(_ catalog: QobuzCatalogViewController, credentials: QobuzCredentials) {
+        catalog.onTracksSelected = { [weak self] tracks in
+            guard let self = self, !tracks.isEmpty else { return }
+            self.playQobuz(tracks: tracks, startingAt: 0, quality: QobuzPreferences.quality)
+        }
+        catalog.onTrackSelected = { [weak self] track in
+            self?.playQobuz(track: track, quality: QobuzPreferences.quality)
+        }
+        catalog.onSongSwipeAction = { [weak self] track, action in
+            guard let self = self else { return }
+            self.rememberQobuz(track)
+            self.handleSongSwipe(action, track: track)
+        }
+        catalog.onTrackNavigationRequested = { [weak self] track in
+            guard let self = self else { return }
+            self.rememberQobuz(track)
+            self.showTrackNavigationMenu(for: track)
+        }
+        catalog.onAlbumQueueRequested = { [weak self] album in
+            guard let self = self else { return }
+            self.rememberQobuz(album: album)
+            self.showAlbumQueueMenu(for: album)
+        }
+        catalog.onAlbumSelected = { [weak self, weak catalog] album in
+            guard let self = self else { return }
+            self.rememberQobuz(album: album)
+            self.showQobuzAlbum(album, credentials: credentials, from: catalog)
+        }
+        catalog.onArtistSelected = { [weak self, weak catalog] artist in
+            guard let self = self else { return }
+            self.rememberQobuz(profile: artist)
+            self.showQobuzArtist(artist, credentials: credentials, from: catalog)
+        }
+        catalog.onPlaylistSelected = { [weak self, weak catalog] playlist in
+            self?.showQobuzPlaylist(playlist, from: catalog)
         }
     }
 
@@ -378,7 +413,14 @@ final class RootViewController: UIViewController {
         controller.onConfigurationChanged = { [weak self] items in
             guard let self = self else { return }
             let enabled = items.filter { $0.isEnabled }.compactMap { LibraryTab(rawValue: $0.id) }
+            let preserveSettings = self.isDisplayingSettings
             self.appState.updateTabConfiguration(TabConfiguration(enabledTabs: enabled))
+            // Settings is not an enabled library tab, but remains the displayed
+            // controller while its switches/order are edited.
+            if preserveSettings {
+                self.appState.currentTab = .settings
+                self.miniPlayer.isHidden = true
+            }
             self.refreshTabStrip()
         }
 
@@ -475,21 +517,40 @@ final class RootViewController: UIViewController {
     }
 
     private func queue(album: ScreenAlbum, action: AlbumQueueAction, hostView: UIView?) {
-        guard !album.tracks.isEmpty else {
-            guard let credentials = QobuzCredentialStore.shared.load() else { return }
-            showQobuzAlbum(album, credentials: credentials, from: topPresentedController())
+        rememberQobuz(album: album)
+        let tracks = album.tracks.isEmpty ? (qobuzAlbumTracksByID[album.id] ?? []) : album.tracks
+        if !tracks.isEmpty {
+            queueAlbumTracks(tracks, action: action, hostView: hostView)
             return
         }
-        album.tracks.forEach(rememberQobuz)
+        guard let credentials = QobuzCredentialStore.shared.load() else {
+            showCatalogError(QobuzStreamingError.notAuthenticated)
+            return
+        }
+        // Grid cards and artist releases can be metadata-only. Resolve tracks
+        // without opening detail or losing the action the user actually chose.
+        fetchQobuzAlbum(album, credentials: credentials) { [weak self, weak hostView] resolvedAlbum in
+            guard let self = self else { return }
+            guard !resolvedAlbum.tracks.isEmpty else {
+                self.showCatalogError(QobuzStreamingError.api("Qobuz returned no tracks for this album. Nothing was added to the queue."))
+                return
+            }
+            self.queueAlbumTracks(resolvedAlbum.tracks, action: action, hostView: hostView)
+        }
+    }
+
+    private func queueAlbumTracks(_ tracks: [ScreenTrack], action: AlbumQueueAction, hostView: UIView?) {
+        guard !tracks.isEmpty else { return }
+        tracks.forEach(rememberQobuz)
         guard ensureQobuzPlaybackBackend(), let playback = playback else { return }
         let wasEmpty = playback.queueState.currentTrackID == nil
         let message = action == .playNext ? "Album Queued Next" : "Album Added to Queue"
         if wasEmpty {
-            playback.setQueue(trackIDs: album.tracks.map(\.id), startingAt: 0)
+            playback.setQueue(trackIDs: tracks.map(\.id), startingAt: 0)
         } else if action == .playNext {
-            for track in album.tracks.reversed() { playback.playNext(trackID: track.id) }
+            for track in tracks.reversed() { playback.playNext(trackID: track.id) }
         } else {
-            for track in album.tracks { playback.enqueue(trackID: track.id) }
+            for track in tracks { playback.enqueue(trackID: track.id) }
         }
         if wasEmpty {
             playback.play()
@@ -569,6 +630,7 @@ final class RootViewController: UIViewController {
         queueController = controller
         renderedQueueTrackIDs = queue.trackIDs
         renderedQueueCurrentIndex = queue.currentIndex
+        renderedQueuePresentationRevision = qobuzPresentationRevision
         controller.onSelectTrack = { [weak self, weak controller] index in
             guard let self = self, let controller = controller, let playback = self.playback else { return }
             let wasPlaying = playback.queueState.isPlaying
@@ -613,7 +675,7 @@ final class RootViewController: UIViewController {
         alert.addAction(UIAlertAction(title: "Artist: \(track.artist)", style: .default) { [weak self] _ in
             guard let self = self,
                   let credentials = QobuzCredentialStore.shared.load(),
-                  let artistID = self.qobuzCatalogArtistIDByName[track.artist.lowercased()] else { return }
+                  let artistID = track.catalogArtistID ?? self.qobuzCatalogArtistIDByName[track.artist.lowercased()] else { return }
             let currentPresenter = self.topPresentedController()
             self.showQobuzArtist(ScreenProfile(id: artistID, name: track.artist, subtitle: "Qobuz artist", information: "", albums: []), credentials: credentials, from: currentPresenter)
         })
@@ -667,7 +729,11 @@ final class RootViewController: UIViewController {
 
     private func currentPlayerState() -> PlayerScreenState? {
         let queue = queueState
-        guard let id = queue.currentTrackID, let track = presentationTrack(id: id) else { return nil }
+        guard let id = queue.currentTrackID, let metadata = presentationTrack(id: id) else {
+            resetCurrentArtwork()
+            return nil
+        }
+        let track = playerPresentationTrack(metadata)
         return PlayerScreenState(
             track: track,
             isPlaying: queue.isPlaying,
@@ -679,8 +745,10 @@ final class RootViewController: UIViewController {
     }
 
     private func updatePlaybackViews(queue: QueueState) {
+        updateQueueViewIfNeeded(queue: queue)
         guard let state = currentPlayerState() else {
             miniPlayer.isHidden = true
+            miniPlayer.artworkImageView.image = nil
             return
         }
         let progress = state.duration > 0 ? CGFloat(state.elapsed / state.duration) : 0
@@ -691,18 +759,62 @@ final class RootViewController: UIViewController {
             isPlaying: state.isPlaying,
             progress: progress
         )
-        if appState.currentTab != .settings {
-            miniPlayer.isHidden = false
-        }
+        miniPlayer.isHidden = isDisplayingSettings || appState.currentTab == .settings
         playerController?.update(state: state)
+    }
+
+    private func updateQueueViewIfNeeded(queue: QueueState) {
+        // Elapsed/play-pause ticks never rebuild queue metadata. Artwork loads
+        // directly into the queue's displayed image views, independent of IDs.
         if let queueController = queueController,
            queueController.viewIfLoaded?.window != nil,
-           renderedQueueTrackIDs != queue.trackIDs || renderedQueueCurrentIndex != queue.currentIndex {
+           renderedQueueTrackIDs != queue.trackIDs || renderedQueueCurrentIndex != queue.currentIndex
+                || renderedQueuePresentationRevision != qobuzPresentationRevision {
             let queueTracks = presentationTracks(for: queue.trackIDs)
             renderedQueueTrackIDs = queue.trackIDs
             renderedQueueCurrentIndex = queue.currentIndex
+            renderedQueuePresentationRevision = qobuzPresentationRevision
             queueController.update(tracks: queueTracks, currentIndex: queue.currentIndex)
         }
+    }
+
+    private func resetCurrentArtwork() {
+        currentArtworkRequestKey = nil
+        currentArtworkGeneration = UUID()
+        currentArtwork = nil
+    }
+
+    private func playerPresentationTrack(_ track: ScreenTrack) -> ScreenTrack {
+        guard let url = track.artworkURL else {
+            if currentArtworkRequestKey != nil { resetCurrentArtwork() }
+            return track
+        }
+        let scale = view.window?.screen.scale ?? UIScreen.main.scale
+        let width = view.bounds.width > 0 ? view.bounds.width : UIScreen.main.bounds.width
+        let pixelSize = max(1, Int(ceil(width * scale)))
+        let cacheKey = "remote|\(url.absoluteString)|\(pixelSize)"
+        let requestKey = "\(track.id)|\(cacheKey)"
+        if currentArtworkRequestKey != requestKey {
+            resetCurrentArtwork()
+            currentArtworkRequestKey = requestKey
+            currentArtwork = ArtworkImagePipeline.shared.cachedImage(for: cacheKey)
+            if currentArtwork == nil {
+                let generation = currentArtworkGeneration
+                let trackID = track.id
+                ArtworkImagePipeline.shared.image(forRemoteURL: url, maximumPixelSize: pixelSize) { [weak self] image in
+                    // The pipeline delivers completions on main. Guard URL as
+                    // well as ID: catalog refreshes can replace a track's cover.
+                    guard let self = self, let image = image,
+                          self.currentArtworkGeneration == generation,
+                          self.currentArtworkRequestKey == requestKey,
+                          self.queueState.currentTrackID == trackID,
+                          self.presentationTrack(id: trackID)?.artworkURL == url else { return }
+                    self.currentArtwork = image
+                    self.updatePlaybackViews(queue: self.queueState)
+                }
+            }
+        }
+        return track.replacingArtwork(currentArtwork)
     }
 
     private func handleSongSwipe(_ action: SongSwipeAction, track: ScreenTrack) {
@@ -710,13 +822,11 @@ final class RootViewController: UIViewController {
         switch action {
         case .enqueue:
             guard qobuzPresentationTracks[track.id] != nil else { return }
-            rememberQobuz(track)
             guard ensureQobuzPlaybackBackend(), let playback = playback else { return }
             playback.enqueue(trackID: track.id)
             message = "Added to Queue"
         case .playNext:
             guard qobuzPresentationTracks[track.id] != nil else { return }
-            rememberQobuz(track)
             guard ensureQobuzPlaybackBackend(), let playback = playback else { return }
             playback.playNext(trackID: track.id)
             message = "Playing Next"
@@ -736,7 +846,6 @@ final class RootViewController: UIViewController {
 
 
     private func playQobuz(track: ScreenTrack, quality: QobuzStreamQuality) {
-        rememberQobuz(track)
         playQobuz(tracks: [track], startingAt: 0, quality: quality)
     }
 
@@ -777,20 +886,15 @@ final class RootViewController: UIViewController {
     }
 
     private func registerQobuzTrack(_ track: ScreenTrack) {
-        qobuzPresentationTracks[track.id] = track
+        // Registration is metadata-only: a selected suffix can contain hundreds
+        // of tracks. Do not retain remote UIImages in an unbounded dictionary.
+        let metadata = track.artworkURL == nil ? track : track.replacingArtwork(nil)
+        if qobuzPresentationTracks[track.id]?.hasSamePresentation(as: metadata) != true {
+            qobuzPresentationRevision += 1
+        }
+        qobuzPresentationTracks[track.id] = metadata
         if let albumID = track.catalogAlbumID { qobuzCatalogAlbumIDByTrackID[track.id] = albumID }
         if let artistID = track.catalogArtistID { qobuzCatalogArtistIDByName[track.artist.lowercased()] = artistID }
-        guard let url = track.artworkURL else { return }
-        ArtworkImagePipeline.shared.image(forRemoteURL: url, maximumPixelSize: 320) { [weak self] image in
-            guard let self = self, let image = image,
-                  let current = self.qobuzPresentationTracks[track.id] else { return }
-            self.qobuzPresentationTracks[track.id] = ScreenTrack(
-                id: current.id, title: current.title, artist: current.artist, album: current.album,
-                quality: current.quality, artwork: image, artworkURL: current.artworkURL,
-                catalogAlbumID: current.catalogAlbumID, catalogArtistID: current.catalogArtistID, duration: current.duration
-            )
-            self.updatePlaybackViews(queue: self.queueState)
-        }
     }
 
     private func rememberQobuz(_ track: ScreenTrack) {
@@ -804,13 +908,24 @@ final class RootViewController: UIViewController {
         }
     }
 
+    private func rememberQobuz(album: ScreenAlbum) {
+        qobuzCatalogAlbumIDs.insert(album.id)
+        // A metadata-only card must not erase a previously resolved album.
+        if !album.tracks.isEmpty {
+            qobuzAlbumTracksByID[album.id] = album.tracks.map { track in
+                track.artworkURL == nil ? track : track.replacingArtwork(nil)
+            }
+        }
+        album.tracks.forEach { track in
+            rememberQobuz(track)
+            qobuzCatalogAlbumIDByTrackID[track.id] = track.catalogAlbumID ?? album.id
+        }
+    }
+
     private func rememberQobuz(profile: ScreenProfile) {
         qobuzCatalogArtistIDByName[profile.name.lowercased()] = profile.id
         profile.tracks.forEach(rememberQobuz)
-        profile.albums.forEach { album in
-            qobuzCatalogAlbumIDs.insert(album.id)
-            album.tracks.forEach(rememberQobuz)
-        }
+        profile.albums.forEach { rememberQobuz(album: $0) }
     }
 
     private func showQobuzAlbum(_ album: ScreenAlbum, credentials: QobuzCredentials, from presentingController: UIViewController? = nil) {
@@ -820,6 +935,18 @@ final class RootViewController: UIViewController {
             presentQobuzAlbum(album, from: presentingController)
             return
         }
+        fetchQobuzAlbum(album, credentials: credentials) { [weak self] resolvedAlbum in
+            self?.presentQobuzAlbum(resolvedAlbum, from: presentingController)
+        }
+    }
+
+    /// Shared detail resolution for opening an album and queueing an album.
+    /// Success registers the complete presentation/ID cache before the action.
+    private func fetchQobuzAlbum(
+        _ album: ScreenAlbum,
+        credentials: QobuzCredentials,
+        completion: @escaping (ScreenAlbum) -> Void
+    ) {
         let client = QobuzStreamingClient(credentials: credentials)
         client.album(id: album.id) { [weak self] result in
             DispatchQueue.main.async {
@@ -832,6 +959,7 @@ final class RootViewController: UIViewController {
                     // Never infer the album artist from the first track performer.
                     if let primaryArtist = detail.artist, !primaryArtist.id.isEmpty {
                         self.qobuzPrimaryArtistByAlbumID[detail.id] = (primaryArtist.id, primaryArtist.name)
+                        self.qobuzCatalogArtistIDByName[primaryArtist.name.lowercased()] = primaryArtist.id
                     } else {
                         self.qobuzPrimaryArtistByAlbumID.removeValue(forKey: detail.id)
                     }
@@ -862,18 +990,15 @@ final class RootViewController: UIViewController {
                         artworkURL: mapped.artworkURL,
                         tracks: tracks
                     )
-                    self.qobuzCatalogAlbumIDs.insert(screenAlbum.id)
-                    screenAlbum.tracks.forEach(self.rememberQobuz)
-                    self.presentQobuzAlbum(screenAlbum, from: presentingController)
+                    self.rememberQobuz(album: screenAlbum)
+                    completion(screenAlbum)
                 }
             }
         }
     }
 
     private func presentQobuzAlbum(_ album: ScreenAlbum, from presentingController: UIViewController? = nil) {
-        qobuzCatalogAlbumIDs.insert(album.id)
-        qobuzAlbumTracksByID[album.id] = album.tracks
-        album.tracks.forEach(rememberQobuz)
+        rememberQobuz(album: album)
         let controller = AlbumDetailViewController(album: album)
         controller.modalPresentationStyle = .fullScreen
         controller.onDismissSwipe = { [weak controller] in
@@ -894,7 +1019,6 @@ final class RootViewController: UIViewController {
             guard let self = self else { return }
             let ordered = shuffle ? tracks.shuffled() : tracks
             guard !ordered.isEmpty else { return }
-            ordered.forEach(self.rememberQobuz)
             self.playQobuz(tracks: ordered, startingAt: 0, quality: QobuzPreferences.quality)
         }
         InteractionMotion.present(controller, from: presentingController ?? self)
@@ -904,15 +1028,12 @@ final class RootViewController: UIViewController {
         let controller = QobuzPlaylistDetailViewController(playlist: playlist)
         controller.modalPresentationStyle = .fullScreen
         controller.onTrackSelected = { [weak self] track in
-            guard let self = self else { return }
-            self.rememberQobuz(track)
-            self.playQobuz(track: track, quality: QobuzPreferences.quality)
+            self?.playQobuz(track: track, quality: QobuzPreferences.quality)
         }
         controller.onPlayRequested = { [weak self] tracks, shuffle in
             guard let self = self else { return }
             let orderedTracks = shuffle ? tracks.shuffled() : tracks
             guard !orderedTracks.isEmpty else { return }
-            orderedTracks.forEach(self.rememberQobuz)
             self.playQobuz(tracks: orderedTracks, startingAt: 0, quality: QobuzPreferences.quality)
         }
         InteractionMotion.present(controller, from: presentingController ?? self)
@@ -996,25 +1117,6 @@ final class RootViewController: UIViewController {
                 duration: TimeInterval(searchTrack.duration ?? 0)
             )
             self.rememberQobuz(screenTrack)
-            if let artworkURL = artworkURL {
-                ArtworkImagePipeline.shared.image(forRemoteURL: artworkURL, maximumPixelSize: 320) { [weak self] artwork in
-                    guard let self = self, let artwork = artwork else { return }
-                    guard let current = self.qobuzPresentationTracks[screenTrack.id] else { return }
-                    self.qobuzPresentationTracks[screenTrack.id] = ScreenTrack(
-                        id: current.id,
-                        title: current.title,
-                        artist: current.artist,
-                        album: current.album,
-                        quality: current.quality,
-                        artwork: artwork,
-                        artworkURL: current.artworkURL,
-                        catalogAlbumID: current.catalogAlbumID,
-                        catalogArtistID: current.catalogArtistID,
-                        duration: current.duration
-                    )
-                    self.updatePlaybackViews(queue: self.queueState)
-                }
-            }
             let provider: (String) -> ScreenTrack? = { [weak self] id in self?.qobuzPresentationTracks[id] }
             let backend = QobuzPlaybackController(
                 client: QobuzStreamingClient(credentials: credentials),
@@ -1030,5 +1132,127 @@ final class RootViewController: UIViewController {
         present(controller, animated: true)
     }
 
+}
 
+// Shared presentation-only operations keep metadata comparisons independent of
+// playback progress and avoid storing fetched images back in catalog caches.
+extension ScreenTrack {
+    func replacingArtwork(_ image: UIImage?) -> ScreenTrack {
+        return ScreenTrack(
+            id: id, title: title, artist: artist, album: album, quality: quality,
+            artwork: image, artworkURL: artworkURL, catalogAlbumID: catalogAlbumID,
+            catalogArtistID: catalogArtistID, duration: duration
+        )
+    }
+
+    func hasSamePresentation(as other: ScreenTrack) -> Bool {
+        return id == other.id && title == other.title && artist == other.artist
+            && album == other.album && quality == other.quality && duration == other.duration
+            && artworkURL == other.artworkURL && artwork === other.artwork
+            && catalogAlbumID == other.catalogAlbumID && catalogArtistID == other.catalogArtistID
+    }
+}
+
+/// Keeps tab navigation at the screen edges, outside the song-row swipe path.
+/// Attach to root content, not the horizontally scrolling tab strip or player.
+final class EdgeTabSwipeCoordinator: NSObject, UIGestureRecognizerDelegate {
+    enum Direction: Equatable {
+        case previous
+        case next
+    }
+
+    private weak var contentView: UIView?
+    private let canNavigate: () -> Bool
+    private let onSwipe: (Bool) -> Void
+    private var startX: CGFloat?
+    private var startWidth: CGFloat = 0
+    private lazy var pan = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
+
+    init(view: UIView, canNavigate: @escaping () -> Bool, onSwipe: @escaping (Bool) -> Void) {
+        contentView = view
+        self.canNavigate = canNavigate
+        self.onSwipe = onSwipe
+        super.init()
+        pan.maximumNumberOfTouches = 1
+        pan.cancelsTouchesInView = true
+        pan.delegate = self
+        view.addGestureRecognizer(pan)
+    }
+
+    /// An inward, horizontal swipe must travel more than 45 points and start
+    /// within the corresponding 24-point edge, matching the original library.
+    static func resolvedDirection(startX: CGFloat, width: CGFloat, translation: CGPoint) -> Direction? {
+        guard abs(translation.x) > 45, abs(translation.x) > abs(translation.y),
+              let edge = startingEdge(startX: startX, width: width) else { return nil }
+        switch edge {
+        case .previous: return translation.x > 0 ? .previous : nil
+        case .next: return translation.x < 0 ? .next : nil
+        }
+    }
+
+    private static func startingEdge(startX: CGFloat, width: CGFloat) -> Direction? {
+        guard width > 48, startX >= 0, startX <= width else { return nil }
+        if startX <= 24 { return .previous }
+        if startX >= width - 24 { return .next }
+        return nil
+    }
+
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+        startX = nil
+        guard gestureRecognizer === pan, canNavigate(),
+              let contentView = contentView, let window = touch.window,
+              let touchedView = touch.view,
+              touchedView.isDescendant(of: contentView),
+              contentView.bounds.contains(touch.location(in: contentView)) else { return false }
+
+        // Leave controls and horizontal catalog filters to their own gestures.
+        // The root tab strip and mini-player are not descendants of content.
+        var ancestor: UIView? = touchedView
+        while let candidate = ancestor, candidate !== contentView {
+            if candidate is UIControl { return false }
+            if let scrollView = candidate as? UIScrollView,
+               scrollView.alwaysBounceHorizontal || scrollView.contentSize.width > scrollView.bounds.width + 1 {
+                return false
+            }
+            ancestor = candidate.superview
+        }
+
+        let x = touch.location(in: window).x
+        let width = window.bounds.width
+        guard Self.startingEdge(startX: x, width: width) != nil else { return false }
+        startX = x
+        startWidth = width
+        return true
+    }
+
+    func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        guard gestureRecognizer === pan, canNavigate(), let contentView = contentView,
+              let startX = startX,
+              let edge = Self.startingEdge(startX: startX, width: startWidth) else { return false }
+        let velocity = pan.velocity(in: contentView)
+        switch edge {
+        case .previous: return velocity.x > abs(velocity.y)
+        case .next: return -velocity.x > abs(velocity.y)
+        }
+    }
+
+    func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
+        shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
+    ) -> Bool {
+        // Interior song-row pans are excluded; vertical motion fails shouldBegin.
+        guard gestureRecognizer === pan,
+              let scrollView = otherGestureRecognizer.view as? UIScrollView else { return false }
+        return otherGestureRecognizer === scrollView.panGestureRecognizer
+    }
+
+    @objc private func handlePan(_ gesture: UIPanGestureRecognizer) {
+        guard gesture.state == .ended else { return }
+        defer { startX = nil }
+        guard canNavigate(), let contentView = contentView, let startX = startX,
+              let direction = Self.resolvedDirection(
+                startX: startX, width: startWidth, translation: gesture.translation(in: contentView)
+              ) else { return }
+        onSwipe(direction == .next)
+    }
 }

@@ -12,6 +12,7 @@ final class QueueViewController: UIViewController, UITableViewDataSource, UITabl
     private var songSwipeCoordinator: SongListSwipeCoordinator?
     private var tracks: [ScreenTrack]
     private var currentIndex: Int
+    private var headerArtworkLoader: QueueArtworkLoader?
 
     init(tracks: [ScreenTrack], currentIndex: Int) {
         self.tracks = tracks
@@ -61,12 +62,32 @@ final class QueueViewController: UIViewController, UITableViewDataSource, UITabl
 
     func update(tracks: [ScreenTrack], currentIndex: Int) {
         let normalizedIndex = max(0, min(currentIndex, max(0, tracks.count - 1)))
-        guard self.tracks.map({ $0.id }) != tracks.map({ $0.id })
-                || self.currentIndex != normalizedIndex else { return }
+        let structureChanged = self.tracks.map({ $0.id }) != tracks.map({ $0.id })
+            || self.currentIndex != normalizedIndex
+        let changedIndices = structureChanged ? [] : tracks.indices.filter {
+            !self.tracks[$0].hasSamePresentation(as: tracks[$0])
+        }
+        guard structureChanged || !changedIndices.isEmpty else { return }
         self.tracks = tracks
         self.currentIndex = normalizedIndex
-        tableView.tableHeaderView = makeHeader()
-        tableView.reloadData()
+        guard isViewLoaded else { return }
+        if structureChanged {
+            tableView.tableHeaderView = makeHeader()
+            tableView.reloadData()
+        } else {
+            // Metadata/URL changes with unchanged queue IDs need not reset row
+            // swipes or scroll position, and artwork completion never reloads.
+            if changedIndices.contains(normalizedIndex) {
+                tableView.tableHeaderView = makeHeader()
+            }
+            for indexPath in tableView.indexPathsForVisibleRows ?? [] {
+                let queueIndex = normalizedIndex + 1 + indexPath.row
+                guard changedIndices.contains(queueIndex),
+                      let cell = tableView.cellForRow(at: indexPath) as? QueueTrackCell else { continue }
+                configure(cell, track: tracks[queueIndex])
+                cell.loadArtwork()
+            }
+        }
     }
 
     private func makeHeader() -> UIView {
@@ -102,6 +123,10 @@ final class QueueViewController: UIViewController, UITableViewDataSource, UITabl
         artwork.clipsToBounds = true
         artwork.layer.cornerRadius = DesignSystem.albumArtworkCornerRadius
         artwork.backgroundColor = DesignSystem.controlFill
+        let artworkLoader = QueueArtworkLoader(imageView: artwork)
+        headerArtworkLoader = artworkLoader
+        artworkLoader.configure(current)
+        artworkLoader.load(pointSize: 62)
         let trackLabel = UILabel()
         trackLabel.translatesAutoresizingMaskIntoConstraints = false
         trackLabel.text = current?.title ?? "Nothing is playing"
@@ -190,10 +215,26 @@ final class QueueViewController: UIViewController, UITableViewDataSource, UITabl
         let queueIndex = currentIndex + 1 + indexPath.row
         let track = tracks[queueIndex]
         let cell = tableView.dequeueReusableCell(withIdentifier: QueueTrackCell.reuseIdentifier, for: indexPath) as! QueueTrackCell
+        configure(cell, track: track)
+        return cell
+    }
+
+    private func configure(_ cell: QueueTrackCell, track: ScreenTrack) {
         cell.configure(track)
         cell.onSwipeAction = { [weak self] action in self?.onSongSwipeAction?(track, action) }
         cell.onLongPress = { [weak self] in self?.onTrackNavigationRequested?(track) }
-        return cell
+    }
+
+    func tableView(_ tableView: UITableView, willDisplay cell: UITableViewCell, forRowAt indexPath: IndexPath) {
+        let queueIndex = currentIndex + 1 + indexPath.row
+        guard tracks.indices.contains(queueIndex), let cell = cell as? QueueTrackCell else { return }
+        // A prefetched/offscreen cell may predate a metadata-only update.
+        configure(cell, track: tracks[queueIndex])
+        cell.loadArtwork()
+    }
+
+    func tableView(_ tableView: UITableView, didEndDisplaying cell: UITableViewCell, forRowAt indexPath: IndexPath) {
+        (cell as? QueueTrackCell)?.cancelArtwork()
     }
 
     func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
@@ -227,6 +268,7 @@ final class QueueViewController: UIViewController, UITableViewDataSource, UITabl
 private final class QueueTrackCell: SongSwipeActionCell {
     static let reuseIdentifier = "QueueTrackCell"
     private let artwork = UIImageView()
+    private lazy var artworkLoader = QueueArtworkLoader(imageView: artwork)
     private let title = UILabel()
     private let metadata = UILabel()
 
@@ -265,10 +307,73 @@ private final class QueueTrackCell: SongSwipeActionCell {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
+    override func prepareForReuse() {
+        super.prepareForReuse()
+        artworkLoader.configure(nil)
+    }
+
     func configure(_ track: ScreenTrack) {
-        artwork.image = track.artwork
+        artworkLoader.configure(track)
         title.text = track.title
         metadata.text = "\(track.artist) · \(track.duration.screenTime)"
+    }
+
+    func loadArtwork() { artworkLoader.load(pointSize: 60) }
+    func cancelArtwork() { artworkLoader.cancel() }
+}
+
+/// A request belongs to a displayed image view, never to the whole queue. The
+/// pipeline owns the bounded decoded cache; loaders retain only request identity.
+private final class QueueArtworkLoader {
+    private weak var imageView: UIImageView?
+    private var trackID: String?
+    private var url: URL?
+    private var requestedKey: String?
+    private var generation = UUID()
+
+    init(imageView: UIImageView) {
+        self.imageView = imageView
+    }
+
+    func configure(_ track: ScreenTrack?) {
+        if trackID != track?.id || url != track?.artworkURL {
+            cancel()
+            imageView?.image = track?.artworkURL == nil ? track?.artwork : nil
+        } else if track?.artworkURL == nil {
+            imageView?.image = track?.artwork
+        }
+        trackID = track?.id
+        url = track?.artworkURL
+    }
+
+    func cancel() {
+        generation = UUID()
+        requestedKey = nil
+        if url != nil { imageView?.image = nil }
+    }
+
+    func load(pointSize: CGFloat) {
+        guard let imageView = imageView, let url = url else { return }
+        let scale = imageView.window?.screen.scale ?? UIScreen.main.scale
+        let pixelSize = max(1, Int(ceil(pointSize * scale)))
+        let key = "remote|\(url.absoluteString)|\(pixelSize)"
+        guard requestedKey != key else { return }
+        requestedKey = key
+        generation = UUID()
+        if let image = ArtworkImagePipeline.shared.cachedImage(for: key) {
+            imageView.image = image
+            return
+        }
+        let generation = self.generation
+        let trackID = self.trackID
+        ArtworkImagePipeline.shared.image(forRemoteURL: url, maximumPixelSize: pixelSize) { [weak self] image in
+            // Pipeline callbacks are main-queue. ID, URL and generation checks
+            // reject reuse, reorder and same-ID/new-cover stale completions.
+            guard let self = self, let image = image,
+                  self.generation == generation, self.requestedKey == key,
+                  self.trackID == trackID, self.url == url else { return }
+            self.imageView?.image = image
+        }
     }
 }
 

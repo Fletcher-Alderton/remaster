@@ -56,6 +56,105 @@ private final class UnexpectedArtworkURLProtocol: URLProtocol {
     override func stopLoading() {}
 }
 
+// Requests remain pending until a test explicitly completes them. This lets us
+// exercise reuse and same-ID/new-URL races without timing-dependent sleeps.
+private final class ControlledArtworkURLProtocol: URLProtocol {
+    private static let lock = NSLock()
+    private static var pending: [URL: [ControlledArtworkURLProtocol]] = [:]
+    private static var requests: [URL] = []
+
+    static var requestedURLs: [URL] {
+        lock.lock(); defer { lock.unlock() }
+        return requests
+    }
+
+    static func hasPending(_ url: URL) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return !(pending[url] ?? []).isEmpty
+    }
+
+    static func complete(_ url: URL, data: Data) {
+        lock.lock()
+        let protocols = pending.removeValue(forKey: url) ?? []
+        lock.unlock()
+        XCTAssertFalse(protocols.isEmpty, "Expected an intercepted artwork request")
+        for item in protocols {
+            let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "image/png"])!
+            item.client?.urlProtocol(item, didReceive: response, cacheStoragePolicy: .notAllowed)
+            item.client?.urlProtocol(item, didLoad: data)
+            item.client?.urlProtocolDidFinishLoading(item)
+        }
+    }
+
+    static func reset() {
+        lock.lock()
+        let protocols = pending.values.flatMap { $0 }
+        pending.removeAll()
+        requests.removeAll()
+        lock.unlock()
+        for item in protocols { item.client?.urlProtocol(item, didFailWithError: URLError(.cancelled)) }
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        request.url?.host == "artwork-regression.invalid"
+    }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        guard let url = request.url else { return }
+        Self.lock.lock()
+        Self.requests.append(url)
+        Self.pending[url, default: []].append(self)
+        Self.lock.unlock()
+    }
+    override func stopLoading() {
+        guard let url = request.url else { return }
+        Self.lock.lock()
+        Self.pending[url]?.removeAll { $0 === self }
+        Self.lock.unlock()
+    }
+}
+
+private final class StubPresentationPlayback: PlaybackControlling {
+    private(set) var queueState = QueueState()
+    var onStateChange: ((QueueState) -> Void)?
+    private(set) var selections: [Int] = []
+
+    func emit(_ state: QueueState) {
+        queueState = state
+        onStateChange?(state)
+    }
+    func setQueue(trackIDs: [String], startingAt index: Int) {
+        selections.append(index)
+        emit(QueueState(trackIDs: trackIDs, currentIndex: index))
+    }
+    func enqueue(trackID: String) {
+        var state = queueState; state.trackIDs.append(trackID); emit(state)
+    }
+    func playNext(trackID: String) {
+        var state = queueState; state.trackIDs.insert(trackID, at: min(state.currentIndex + 1, state.trackIDs.count)); emit(state)
+    }
+    func togglePlayPause() { queueState.isPlaying ? pause() : play() }
+    func play() { var state = queueState; state.isPlaying = true; emit(state) }
+    func pause() { var state = queueState; state.isPlaying = false; emit(state) }
+    func seek(to elapsed: TimeInterval) { var state = queueState; state.elapsed = elapsed; emit(state) }
+    func next() { var state = queueState; state.currentIndex += 1; emit(state) }
+    func previous() { var state = queueState; state.currentIndex = max(0, state.currentIndex - 1); emit(state) }
+    func setShuffled(_ shuffled: Bool) { var state = queueState; state.isShuffled = shuffled; emit(state) }
+    func clearQueue() { emit(QueueState()) }
+}
+
+// Deterministic input for the real UIKit long-press handler, without sleeps or
+// touching a simulator. Locations are expressed in the handler's target view.
+private final class TestAlbumLongPressRecognizer: UILongPressGestureRecognizer {
+    var simulatedState: UIGestureRecognizer.State = .began
+    var simulatedLocation = CGPoint.zero
+    override var state: UIGestureRecognizer.State {
+        get { simulatedState }
+        set { simulatedState = newValue }
+    }
+    override func location(in view: UIView?) -> CGPoint { simulatedLocation }
+}
+
 final class DataLayerTests: XCTestCase {
     func testQobuzMP3RequestSignatureMatchesQobineProtocol() {
         XCTAssertEqual(
@@ -533,38 +632,90 @@ final class DataLayerTests: XCTestCase {
         }
         defer { session.invalidateAndCancel(); QobuzCatalogURLProtocol.handler = nil }
         let client = QobuzStreamingClient(credentials: QobuzCredentials(userAuthToken: "test-token", userID: 1), session: session, catalogAppID: "test-app-id")
-        let cases: [(QobuzCatalogViewController.Mode, String)] = [(.albums, "Café Sessions"), (.artists, "Café Artist"), (.tracks, "Café Song")]
+        let cases: [(QobuzCatalogViewController.Mode, String, String)] = [(.albums, "Café Sessions", "Nightfall"), (.artists, "Café Artist", "Other Artist"), (.tracks, "Café Song", "Night Song")]
         for (index, testCase) in cases.enumerated() {
             let controller = QobuzCatalogViewController(mode: testCase.0, client: client)
             layout(controller, size: CGSize(width: 320, height: 568))
-            let table = try XCTUnwrap(controller.view.subviews.compactMap { $0 as? UITableView }.first)
-            let search = try XCTUnwrap(controller.view.subviews.compactMap { $0 as? UISearchBar }.first)
-            waitForMainCondition("saved library rows load") { table.numberOfRows(inSection: 0) == 2 }
-            XCTAssertNotNil(table.refreshControl)
+            let table = descendants(of: controller.view).compactMap { $0 as? UITableView }.first
+            let collection = descendants(of: controller.view).compactMap { $0 as? UICollectionView }.first
+            if testCase.0 == .albums {
+                XCTAssertNotNil(collection, "Saved albums must be a collection grid, not table rows")
+                XCTAssertNil(table)
+            } else {
+                XCTAssertNotNil(table)
+                XCTAssertNil(collection)
+            }
+            func itemCount() -> Int { collection?.numberOfItems(inSection: 0) ?? table?.numberOfRows(inSection: 0) ?? -1 }
+            func firstItem() -> UIView? {
+                collection?.layoutIfNeeded(); table?.layoutIfNeeded()
+                if let collection = collection { return collection.cellForItem(at: IndexPath(item: 0, section: 0)) }
+                return table?.cellForRow(at: IndexPath(row: 0, section: 0))
+            }
+            func assertFirstTitle(_ expected: String, file: StaticString = #filePath, line: UInt = #line) throws {
+                let cell = try XCTUnwrap(firstItem(), file: file, line: line)
+                XCTAssertTrue(descendants(of: cell).compactMap { $0 as? UILabel }.contains { $0.text == expected }, "Expected displayed title: \(expected)", file: file, line: line)
+            }
+            let search = try XCTUnwrap(descendants(of: controller.view).compactMap { $0 as? UISearchBar }.first)
+            let tools = try XCTUnwrap(descendants(of: controller.view).first { $0.accessibilityIdentifier == "qobuz.library.tools" })
+            let sort = try XCTUnwrap(descendants(of: tools).compactMap { $0 as? UISegmentedControl }.first)
+            let refresh = try XCTUnwrap(descendants(of: tools).first { $0.accessibilityIdentifier == "qobuz.library.refresh" } as? UIButton)
+            waitForMainCondition("saved library items load") { itemCount() == 2 }
+            XCTAssertNil(table?.refreshControl, "Pull-down reveals tools; refresh is an explicit button")
+            XCTAssertNil(collection?.refreshControl)
+            XCTAssertEqual(tools.bounds.height, 0, accuracy: 0.5)
+            XCTAssertEqual(sort.accessibilityIdentifier, "qobuz.library.sort")
+            XCTAssertEqual((0..<sort.numberOfSegments).compactMap { sort.titleForSegment(at: $0) }, ["All", "A–Z", "Z–A"])
+            XCTAssertEqual(sort.selectedSegmentIndex, 0)
             XCTAssertTrue(search.placeholder?.hasPrefix("Search saved ") == true)
+            controller.setLibraryToolsVisible(true, animated: false)
+            XCTAssertGreaterThan(tools.bounds.height, 0)
             search.text = "  CAFE  "
             controller.searchBar(search, textDidChange: search.text!)
-            XCTAssertEqual(table.numberOfRows(inSection: 0), 1)
-            table.layoutIfNeeded()
-            XCTAssertEqual(table.cellForRow(at: IndexPath(row: 0, section: 0))?.textLabel?.text, testCase.1)
+            XCTAssertEqual(itemCount(), 1)
+            try assertFirstTitle(testCase.1)
             controller.searchBarSearchButtonClicked(search)
-            XCTAssertEqual(table.numberOfRows(inSection: 0), 1)
+            XCTAssertEqual(itemCount(), 1)
             if testCase.0 != .artists {
                 search.text = "ADA RIVERS"
                 controller.searchBar(search, textDidChange: "ADA RIVERS")
-                XCTAssertEqual(table.numberOfRows(inSection: 0), 1, "Local filtering must also match the saved artist name")
-                table.layoutIfNeeded()
-                XCTAssertEqual(table.cellForRow(at: IndexPath(row: 0, section: 0))?.textLabel?.text, testCase.1)
+                XCTAssertEqual(itemCount(), 1, "Local filtering must also match the saved artist name")
+                try assertFirstTitle(testCase.1)
             }
+            controller.setLibraryToolsVisible(false, animated: false)
+            XCTAssertEqual(tools.bounds.height, 0, accuracy: 0.5)
+            XCTAssertEqual(itemCount(), 1, "Hiding tools must not reset a saved-library filter")
+            controller.setLibraryToolsVisible(true, animated: false)
             search.text = "not in this saved library"
             controller.searchBar(search, textDidChange: search.text!)
-            XCTAssertEqual(table.numberOfRows(inSection: 0), 0)
+            XCTAssertEqual(itemCount(), 0)
             search.text = ""
             controller.searchBar(search, textDidChange: "")
-            XCTAssertEqual(table.numberOfRows(inSection: 0), 2)
+            XCTAssertEqual(itemCount(), 2)
+            for segment in [1, 2, 0] {
+                sort.selectedSegmentIndex = segment
+                sort.sendActions(for: .valueChanged)
+                XCTAssertEqual(itemCount(), 2)
+                try assertFirstTitle(segment == 2 ? testCase.2 : testCase.1)
+            }
             drainMainQueue()
             lock.lock(); let paths = requestedPaths; lock.unlock()
-            XCTAssertEqual(paths, Array(repeating: "/api.json/0.2/favorite/getUserFavorites", count: index + 1), "Typing, submitting, and clearing a saved-library filter must not make requests")
+            XCTAssertEqual(paths, Array(repeating: "/api.json/0.2/favorite/getUserFavorites", count: index * 2 + 1), "Typing, submitting, clearing, sorting, and revealing tools must not make requests")
+            search.text = "CAFE"
+            controller.searchBar(search, textDidChange: "CAFE")
+            sort.selectedSegmentIndex = 2
+            sort.sendActions(for: .valueChanged)
+            let status = try XCTUnwrap(descendants(of: controller.view).first { $0.accessibilityIdentifier?.hasSuffix(".status") == true } as? UILabel)
+            refresh.sendActions(for: .touchUpInside)
+            waitForMainCondition("explicit refresh completes") {
+                lock.lock(); let count = requestedPaths.count; lock.unlock()
+                return count == index * 2 + 2 && refresh.isEnabled && status.text?.hasPrefix("1 saved ") == true
+            }
+            XCTAssertEqual(itemCount(), 1)
+            XCTAssertEqual(search.text, "CAFE", "Explicit refresh must preserve the local query")
+            XCTAssertEqual(sort.selectedSegmentIndex, 2, "Explicit refresh must preserve the local sort")
+            try assertFirstTitle(testCase.1)
+            lock.lock(); let refreshedPaths = requestedPaths; lock.unlock()
+            XCTAssertEqual(refreshedPaths, Array(repeating: "/api.json/0.2/favorite/getUserFavorites", count: index * 2 + 2), "Only explicit refresh adds one authenticated favorites request")
         }
     }
 
@@ -580,7 +731,7 @@ final class DataLayerTests: XCTestCase {
         controller.onTrackSelected = { selected.append($0) }
         layout(controller, size: CGSize(width: 375, height: 667))
         let table = try XCTUnwrap(controller.view.subviews.compactMap { $0 as? UITableView }.first)
-        let search = try XCTUnwrap(controller.view.subviews.compactMap { $0 as? UISearchBar }.first)
+        let search = try XCTUnwrap(descendants(of: controller.view).compactMap { $0 as? UISearchBar }.first)
         waitForMainCondition("saved tracks load") { table.numberOfRows(inSection: 0) == 2 }
         search.text = "Chosen Album"
         controller.searchBar(search, textDidChange: "Chosen Album")
@@ -592,6 +743,319 @@ final class DataLayerTests: XCTestCase {
         XCTAssertEqual(selected.first?.catalogAlbumID, "chosen-album")
         XCTAssertEqual(selected.first?.catalogArtistID, "43")
         XCTAssertEqual(selected.first?.duration, 215)
+    }
+
+    // Deliberately unsorted, with a nonmatching track between saved matches.
+    private var savedTrackInteractionFixture: Data {
+        Data(#"{"tracks":{"items":[{"id":701,"title":"Cedar Song","performer":{"id":42,"name":"Ada Rivers"},"album":{"id":"keep","title":"Keep Album"}},{"id":702,"title":"Zulu Song","performer":{"id":42,"name":"Ada Rivers"},"album":{"id":"keep","title":"Keep Album"}},{"id":703,"title":"Hidden Song","performer":{"id":43,"name":"Other Artist"},"album":{"id":"other","title":"Other Album"}},{"id":704,"title":"Alpha Song","performer":{"id":42,"name":"Ada Rivers"},"album":{"id":"keep","title":"Keep Album"}},{"id":705,"title":"Echo Song","performer":{"id":42,"name":"Ada Rivers"},"album":{"id":"keep","title":"Keep Album"}}],"total":5}}"#.utf8)
+    }
+
+    func testSavedTrackSelectionQueuesOnlyTheFilteredSortedSuffix() throws {
+        let lock = NSLock()
+        var requestCount = 0
+        let session = catalogTestSession { request in
+            XCTAssertEqual(request.url?.path, "/api.json/0.2/favorite/getUserFavorites")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "X-App-Id"), "test-app-id")
+            lock.lock(); requestCount += 1; lock.unlock()
+            return (200, self.savedTrackInteractionFixture)
+        }
+        defer { session.invalidateAndCancel(); QobuzCatalogURLProtocol.handler = nil }
+        let client = QobuzStreamingClient(credentials: QobuzCredentials(userAuthToken: "test-token", userID: 1), session: session, catalogAppID: "test-app-id")
+        let controller = QobuzCatalogViewController(mode: .tracks, client: client)
+        var selections: [[String]] = []
+        var fallbackSelections: [String] = []
+        controller.onTracksSelected = { selections.append($0.map(\.id)) }
+        controller.onTrackSelected = { fallbackSelections.append($0.id) }
+        layout(controller, size: CGSize(width: 375, height: 667))
+        let table = try XCTUnwrap(descendants(of: controller.view).compactMap { $0 as? UITableView }.first)
+        let search = try XCTUnwrap(descendants(of: controller.view).compactMap { $0 as? UISearchBar }.first)
+        let sort = try XCTUnwrap(descendants(of: controller.view).first { $0.accessibilityIdentifier == "qobuz.library.sort" } as? UISegmentedControl)
+        waitForMainCondition("saved tracks load") { table.numberOfRows(inSection: 0) == 5 }
+        controller.setLibraryToolsVisible(true, animated: false)
+        search.text = "  KEEP ALBUM  "
+        controller.searchBar(search, textDidChange: search.text!)
+        XCTAssertEqual(table.numberOfRows(inSection: 0), 4)
+        controller.tableView(table, didSelectRowAt: IndexPath(row: 1, section: 0))
+        XCTAssertEqual(selections, [["702", "704", "705"]], "Do not queue preceding saved matches or tracks excluded by the filter")
+        sort.selectedSegmentIndex = 1
+        sort.sendActions(for: .valueChanged)
+        controller.tableView(table, didSelectRowAt: IndexPath(row: 1, section: 0))
+        XCTAssertEqual(selections.last, ["701", "705", "702"], "A–Z selection must use displayed order, not original favorites order")
+        sort.selectedSegmentIndex = 2
+        sort.sendActions(for: .valueChanged)
+        controller.tableView(table, didSelectRowAt: IndexPath(row: 1, section: 0))
+        XCTAssertEqual(selections.last, ["705", "701", "704"], "Z–A selection must use displayed order")
+        controller.tableView(table, didSelectRowAt: IndexPath(row: 3, section: 0))
+        XCTAssertEqual(selections.last, ["704"], "The final row queues exactly itself")
+        sort.selectedSegmentIndex = 0
+        sort.sendActions(for: .valueChanged)
+        controller.tableView(table, didSelectRowAt: IndexPath(row: 1, section: 0))
+        XCTAssertEqual(selections.last, ["702", "704", "705"], "All restores saved order")
+        XCTAssertTrue(fallbackSelections.isEmpty, "The single-track callback is only a fallback, not a second playback request")
+        drainMainQueue()
+        lock.lock(); let count = requestCount; lock.unlock()
+        XCTAssertEqual(count, 1, "Filter, sort, and selection are local operations")
+    }
+
+    func testSavedTrackRowsUseHistoricalLayoutAndRouteSwipeAndLongPressActions() throws {
+        let session = catalogTestSession { request in
+            XCTAssertEqual(request.url?.path, "/api.json/0.2/favorite/getUserFavorites")
+            return (200, self.savedTrackInteractionFixture)
+        }
+        defer { session.invalidateAndCancel(); QobuzCatalogURLProtocol.handler = nil }
+        let client = QobuzStreamingClient(credentials: QobuzCredentials(userAuthToken: "test-token", userID: 1), session: session, catalogAppID: "test-app-id")
+        let controller = QobuzCatalogViewController(mode: .tracks, client: client)
+        var actions: [SongSwipeAction] = []
+        var navigations: [String] = []
+        controller.onSongSwipeAction = { track, action in
+            XCTAssertEqual(track.id, "704", "Actions must address the displayed filtered track")
+            actions.append(action)
+        }
+        controller.onTrackNavigationRequested = { navigations.append($0.id) }
+        layout(controller, size: CGSize(width: 320, height: 568))
+        let table = try XCTUnwrap(descendants(of: controller.view).compactMap { $0 as? UITableView }.first)
+        let search = try XCTUnwrap(descendants(of: controller.view).compactMap { $0 as? UISearchBar }.first)
+        waitForMainCondition("saved action tracks load") { table.numberOfRows(inSection: 0) == 5 }
+        search.text = "Alpha"
+        controller.searchBar(search, textDidChange: "Alpha")
+        table.layoutIfNeeded()
+        let cell = try XCTUnwrap(table.cellForRow(at: IndexPath(row: 0, section: 0)) as? SongSwipeActionCell)
+        cell.layoutIfNeeded()
+        XCTAssertEqual(table.rowHeight, 78, accuracy: 0.5)
+        XCTAssertEqual(cell.bounds.height, 78, accuracy: 0.5)
+        let art = try XCTUnwrap(descendants(of: cell).compactMap { $0 as? ArtworkView }.first)
+        XCTAssertEqual(art.bounds.width, 54, accuracy: 0.5)
+        XCTAssertEqual(art.bounds.height, 54, accuracy: 0.5)
+        XCTAssertEqual(art.layer.cornerRadius, DesignSystem.albumArtworkCornerRadius, accuracy: 0.5)
+        let labels = descendants(of: cell).compactMap { $0 as? UILabel }
+        let title = try XCTUnwrap(labels.first { $0.text == "Alpha Song" })
+        let subtitle = try XCTUnwrap(labels.first { $0.text?.contains("Ada Rivers") == true && $0.text?.contains("Keep Album") == true })
+        XCTAssertEqual(title.font.pointSize, 18, accuracy: 0.1)
+        XCTAssertEqual(subtitle.font.pointSize, 14, accuracy: 0.1)
+        XCTAssertEqual(title.font, UIFont.systemFont(ofSize: 18))
+        XCTAssertEqual(art.convert(art.bounds, to: cell.contentView).minX, 8, accuracy: 0.5)
+        XCTAssertEqual(title.convert(title.bounds, to: cell.contentView).minX - art.convert(art.bounds, to: cell.contentView).maxX, 14, accuracy: 0.5)
+        // VoiceOver focuses the row as one element, not its implementation labels.
+        assertGroupedAccessibility(cell, contains: ["Alpha Song", "Ada Rivers", "Keep Album"])
+        XCTAssertEqual(cell.accessibilityCustomActions?.map(\.name) ?? [], [], "Catalog currently exposes gesture callbacks, not custom VoiceOver actions")
+        for size in [CGSize(width: 320, height: 568), CGSize(width: 375, height: 667)] {
+            layout(controller, size: size)
+            retainVisualCapture(controller.view, name: "Saved tracks custom row \(Int(size.width))")
+        }
+        XCTAssertTrue((table.gestureRecognizers ?? []).contains { $0 is UIPanGestureRecognizer && $0.delegate is SongListSwipeCoordinator }, "Real track tables must install the song-swipe coordinator")
+        cell.finishSwipe(translation: -cell.bounds.width * 0.10)
+        XCTAssertTrue(actions.isEmpty, "A below-threshold drag must not enqueue")
+        for translation in [-0.35, -0.75, 0.35, 0.75] {
+            cell.updateSwipe(translation: cell.bounds.width * CGFloat(translation))
+            cell.finishSwipe(translation: cell.bounds.width * CGFloat(translation))
+        }
+        cell.onLongPress?()
+        XCTAssertEqual(actions, [.enqueue, .playNext, .toggleLike, .more])
+        XCTAssertEqual(navigations, ["704"])
+        XCTAssertTrue((cell.gestureRecognizers ?? []).contains { ($0 as? UILongPressGestureRecognizer)?.minimumPressDuration == 0.45 })
+        cell.prepareForReuse()
+        XCTAssertNil(cell.onLongPress)
+        XCTAssertNil(cell.onSwipeAction)
+    }
+
+    func testSavedArtistRowsKeepHistoricalTypographyAndRoundArtwork() throws {
+        let session = catalogTestSession { request in
+            XCTAssertEqual(request.url?.path, "/api.json/0.2/favorite/getUserFavorites")
+            return (200, Data(#"{"artists":{"items":[{"id":42,"name":"Ada Rivers","albums_count":17}],"total":1}}"#.utf8))
+        }
+        defer { session.invalidateAndCancel(); QobuzCatalogURLProtocol.handler = nil }
+        let client = QobuzStreamingClient(credentials: QobuzCredentials(userAuthToken: "test-token", userID: 1), session: session, catalogAppID: "test-app-id")
+        for size in [CGSize(width: 320, height: 568), CGSize(width: 375, height: 667)] {
+            let controller = QobuzCatalogViewController(mode: .artists, client: client)
+            var selected: [String] = []
+            controller.onArtistSelected = { selected.append($0.id) }
+            layout(controller, size: size)
+            let table = try XCTUnwrap(descendants(of: controller.view).compactMap { $0 as? UITableView }.first)
+            waitForMainCondition("saved artist loads") { table.numberOfRows(inSection: 0) == 1 }
+            table.layoutIfNeeded()
+            let cell = try XCTUnwrap(table.cellForRow(at: IndexPath(row: 0, section: 0)))
+            cell.layoutIfNeeded()
+            let title = try XCTUnwrap(descendants(of: cell).compactMap { $0 as? UILabel }.first { $0.text == "Ada Rivers" })
+            let art = try XCTUnwrap(descendants(of: cell).compactMap { $0 as? ArtworkView }.first)
+            XCTAssertEqual(cell.bounds.height, 78, accuracy: 0.5)
+            XCTAssertEqual(art.bounds.width, 54, accuracy: 0.5)
+            XCTAssertEqual(art.bounds.height, 54, accuracy: 0.5)
+            XCTAssertEqual(art.layer.cornerRadius, 27, accuracy: 0.5)
+            XCTAssertEqual(title.font.pointSize, 18, accuracy: 0.1)
+            XCTAssertEqual(title.font, UIFont.systemFont(ofSize: 18))
+            XCTAssertEqual(title.convert(title.bounds, to: cell.contentView).midY, cell.contentView.bounds.midY, accuracy: 0.5)
+            assertGroupedAccessibility(cell, contains: ["Ada Rivers"])
+            XCTAssertEqual(cell.accessibilityCustomActions?.map(\.name) ?? [], [], "Artist rows open on activation; track-specific actions must not leak through reuse")
+            let visibleLabels = descendants(of: cell).compactMap { $0 as? UILabel }.filter { !$0.isHidden && !($0.text ?? "").isEmpty }
+            XCTAssertEqual(visibleLabels.map(\.text), ["Ada Rivers"], "Saved artists have a single centered name, not catalog count metadata")
+            XCTAssertFalse(art.hasAmbiguousLayout)
+            XCTAssertFalse(title.hasAmbiguousLayout)
+            XCTAssertGreaterThan(title.bounds.width, 100)
+            controller.tableView(table, didSelectRowAt: IndexPath(row: 0, section: 0))
+            XCTAssertEqual(selected, ["42"])
+            retainVisualCapture(controller.view, name: "Saved artists custom row \(Int(size.width))")
+        }
+    }
+
+    func testSavedAlbumGridUsesHistoricalTwoColumnSpacingAndSizedArtworkCache() throws {
+        XCTAssertTrue(URLProtocol.registerClass(UnexpectedArtworkURLProtocol.self))
+        defer { URLProtocol.unregisterClass(UnexpectedArtworkURLProtocol.self); ArtworkImagePipeline.shared.removeAll() }
+        for size in [CGSize(width: 320, height: 568), CGSize(width: 375, height: 667)] {
+            let url = URL(string: "https://artwork-regression.invalid/library-cover-\(UUID().uuidString).jpg")!
+            let cardWidth = floor((size.width - 44) / 2)
+            let cached = preloadArtwork(url: url, pointSize: cardWidth, color: .green)
+            let session = catalogTestSession { request in
+                XCTAssertEqual(request.url?.path, "/api.json/0.2/favorite/getUserFavorites")
+                let albums: [[String: Any]] = (0..<3).map { index in
+                    ["id": "a\(index)", "title": "Saved Album \(index)", "artist": ["id": 42, "name": "Ada Rivers"], "image": ["large": url.absoluteString], "release_date_original": "2024-04-05"]
+                }
+                return (200, try JSONSerialization.data(withJSONObject: ["albums": ["items": albums, "total": 3]]))
+            }
+            defer { session.invalidateAndCancel(); QobuzCatalogURLProtocol.handler = nil }
+            let client = QobuzStreamingClient(credentials: QobuzCredentials(userAuthToken: "test-token", userID: 1), session: session, catalogAppID: "test-app-id")
+            let controller = QobuzCatalogViewController(mode: .albums, client: client)
+            var selected: [String] = []
+            controller.onAlbumSelected = { selected.append($0.id) }
+            layout(controller, size: size)
+            XCTAssertTrue(descendants(of: controller.view).compactMap { $0 as? UITableView }.isEmpty)
+            let collection = try XCTUnwrap(descendants(of: controller.view).compactMap { $0 as? UICollectionView }.first)
+            waitForMainCondition("saved album grid loads") { collection.numberOfItems(inSection: 0) == 3 }
+            collection.layoutIfNeeded()
+            drainMainQueue()
+            let flow = try XCTUnwrap(collection.collectionViewLayout as? UICollectionViewFlowLayout)
+            XCTAssertEqual(flow.minimumInteritemSpacing, 16, accuracy: 0.5)
+            XCTAssertEqual(flow.minimumLineSpacing, 28, accuracy: 0.5)
+            XCTAssertEqual(flow.sectionInset.left, 14, accuracy: 0.5)
+            XCTAssertEqual(flow.sectionInset.right, 14, accuracy: 0.5)
+            XCTAssertEqual(flow.sectionInset.top, 18, accuracy: 0.5)
+            XCTAssertEqual(flow.sectionInset.bottom, 102, accuracy: 0.5)
+            let first = try XCTUnwrap(collection.cellForItem(at: IndexPath(item: 0, section: 0)))
+            let second = try XCTUnwrap(collection.cellForItem(at: IndexPath(item: 1, section: 0)))
+            let thirdAttributes = try XCTUnwrap(collection.layoutAttributesForItem(at: IndexPath(item: 2, section: 0)))
+            first.layoutIfNeeded(); second.layoutIfNeeded()
+            XCTAssertEqual(collection.bounds.width, size.width, accuracy: 0.5)
+            XCTAssertEqual(first.bounds.width, cardWidth, accuracy: 0.5)
+            XCTAssertEqual(first.bounds.height, cardWidth + 50, accuracy: 0.5)
+            XCTAssertEqual(second.frame.minY, first.frame.minY, accuracy: 0.5)
+            XCTAssertGreaterThanOrEqual(second.frame.minX - first.frame.maxX, 16 - 0.5)
+            XCTAssertEqual(thirdAttributes.frame.minX, first.frame.minX, accuracy: 0.5)
+            XCTAssertEqual(thirdAttributes.frame.minY - first.frame.maxY, 28, accuracy: 0.5)
+            let art = try XCTUnwrap(descendants(of: first).compactMap { $0 as? ArtworkView }.first)
+            XCTAssertEqual(art.bounds.width, cardWidth, accuracy: 0.5)
+            XCTAssertEqual(art.bounds.height, cardWidth, accuracy: 0.5)
+            XCTAssertTrue(art.image === cached, "Grid covers must use the final square point size, not the old 54 pt table image or unsized cache")
+            XCTAssertFalse(art.hasAmbiguousLayout)
+            let labels = descendants(of: first).compactMap { $0 as? UILabel }
+            let title = try XCTUnwrap(labels.first { $0.text == "Saved Album 0" })
+            let metadata = try XCTUnwrap(labels.first { $0.text?.contains("Ada Rivers") == true })
+            XCTAssertEqual(title.font.pointSize, 17, accuracy: 0.1)
+            XCTAssertEqual(title.font, UIFont.systemFont(ofSize: 17, weight: .semibold))
+            XCTAssertEqual(metadata.font.pointSize, 14, accuracy: 0.1)
+            XCTAssertTrue(metadata.text?.contains("2024") == true)
+            assertGroupedAccessibility(first, contains: ["Saved Album 0", "Ada Rivers", "2024"])
+            XCTAssertTrue(first.accessibilityTraits.contains(.button))
+            XCTAssertEqual(first.accessibilityCustomActions?.map(\.name) ?? [], [])
+            retainVisualCapture(controller.view, name: "Saved albums two-column grid \(Int(size.width))")
+            controller.collectionView(collection, didSelectItemAt: IndexPath(item: 1, section: 0))
+            XCTAssertEqual(selected, ["a1"])
+            // Cached completions are still asynchronous: reuse must invalidate
+            // the old configuration even when the URL/index path has not changed.
+            art.image = nil
+            controller.collectionView(collection, willDisplay: first, forItemAt: IndexPath(item: 0, section: 0))
+            first.prepareForReuse()
+            drainMainQueue()
+            XCTAssertNil(art.image, "A stale artwork completion must not paint a reused card")
+        }
+    }
+
+    func testSavedAlbumSelectionAndLongPressUseFilteredSortedCards() throws {
+        let session = catalogTestSession { request in
+            XCTAssertEqual(request.url?.path, "/api.json/0.2/favorite/getUserFavorites")
+            return (200, Data(#"{"albums":{"items":[{"id":"cedar","title":"Keep Cedar","artist":{"id":42,"name":"Ada Rivers"}},{"id":"hidden","title":"Excluded Album","artist":{"id":43,"name":"Other Artist"}},{"id":"alpha","title":"Keep Alpha","artist":{"id":42,"name":"Ada Rivers"}},{"id":"echo","title":"Keep Echo","artist":{"id":42,"name":"Ada Rivers"}}],"total":4}}"#.utf8))
+        }
+        defer { session.invalidateAndCancel(); QobuzCatalogURLProtocol.handler = nil }
+        let client = QobuzStreamingClient(credentials: QobuzCredentials(userAuthToken: "test-token", userID: 1), session: session, catalogAppID: "test-app-id")
+        let controller = QobuzCatalogViewController(mode: .albums, client: client)
+        var selected: [String] = []
+        var queued: [String] = []
+        controller.onAlbumSelected = { selected.append($0.id) }
+        controller.onAlbumQueueRequested = { queued.append($0.id) }
+        layout(controller, size: CGSize(width: 375, height: 667))
+        let collection = try XCTUnwrap(descendants(of: controller.view).compactMap { $0 as? UICollectionView }.first)
+        let search = try XCTUnwrap(descendants(of: controller.view).compactMap { $0 as? UISearchBar }.first)
+        let sort = try XCTUnwrap(descendants(of: controller.view).first { $0.accessibilityIdentifier == "qobuz.library.sort" } as? UISegmentedControl)
+        waitForMainCondition("saved queue albums load") { collection.numberOfItems(inSection: 0) == 4 }
+        controller.setLibraryToolsVisible(true, animated: false)
+        search.text = "Keep"
+        controller.searchBar(search, textDidChange: "Keep")
+        sort.selectedSegmentIndex = 2
+        sort.sendActions(for: .valueChanged)
+        XCTAssertEqual(collection.numberOfItems(inSection: 0), 3)
+        collection.layoutIfNeeded()
+        controller.collectionView(collection, didSelectItemAt: IndexPath(item: 1, section: 0))
+        XCTAssertEqual(selected, ["cedar"])
+        let recognizer = try XCTUnwrap((collection.gestureRecognizers ?? []).compactMap { $0 as? UILongPressGestureRecognizer }.first { $0.name == "qobuz.albums.queueLongPress" })
+        XCTAssertEqual(recognizer.minimumPressDuration, 0.45, accuracy: 0.01)
+        let first = try XCTUnwrap(collection.layoutAttributesForItem(at: IndexPath(item: 0, section: 0)))
+        let gesture = TestAlbumLongPressRecognizer()
+        gesture.simulatedLocation = CGPoint(x: first.frame.midX, y: first.frame.midY)
+        let selector = NSSelectorFromString("albumLongPressed:")
+        XCTAssertTrue(controller.responds(to: selector))
+        guard controller.responds(to: selector) else { return }
+        _ = controller.perform(selector, with: gesture)
+        XCTAssertEqual(queued, ["echo"], "Long press must queue the displayed card, not the original favorites index")
+        XCTAssertEqual(selected, ["cedar"], "Long press is not an album-open tap")
+        gesture.simulatedState = .changed
+        _ = controller.perform(selector, with: gesture)
+        gesture.simulatedState = .ended
+        _ = controller.perform(selector, with: gesture)
+        XCTAssertEqual(queued, ["echo"], "A single long press must not emit duplicate queue menus")
+        gesture.simulatedState = .began
+        gesture.simulatedLocation = CGPoint(x: -10, y: -10)
+        _ = controller.perform(selector, with: gesture)
+        XCTAssertEqual(queued, ["echo"], "Pressing outside a card must do nothing")
+    }
+
+    func testDiscoveryAndSearchDoNotExposeSavedLibraryTools() throws {
+        let lock = NSLock()
+        var requestCount = 0
+        let session = catalogTestSession { request in
+            lock.lock(); requestCount += 1; lock.unlock()
+            XCTAssertNotEqual(request.url?.path, "/api.json/0.2/favorite/getUserFavorites")
+            // Discovery currently uses web-player configuration rather than the
+            // library's injected app ID. Intercept that too, without populating
+            // or clearing a user's persistent signing-configuration cache.
+            if request.url?.host == "play.qobuz.com" {
+                return (503, Data(#"{"message":"Web-player discovery disabled in this UI test"}"#.utf8))
+            }
+            XCTAssertTrue(["/api.json/0.2/genre/list", "/api.json/0.2/discover/index", "/api.json/0.2/discover/playlists"].contains(request.url?.path ?? ""))
+            return (200, Data(#"{"containers":{},"genres":{"items":[]},"items":[],"total":0}"#.utf8))
+        }
+        defer { session.invalidateAndCancel(); QobuzCatalogURLProtocol.handler = nil }
+        let client = QobuzStreamingClient(credentials: QobuzCredentials(userAuthToken: "test-token", userID: 1), session: session, catalogAppID: "test-app-id")
+        for mode in [QobuzCatalogViewController.Mode.discover, .search] {
+            let controller = QobuzCatalogViewController(mode: mode, client: client)
+            layout(controller, size: CGSize(width: 320, height: 568))
+            let views = descendants(of: controller.view)
+            for identifier in ["qobuz.library.tools", "qobuz.library.sort", "qobuz.library.refresh"] {
+                XCTAssertFalse(views.contains { $0.accessibilityIdentifier == identifier }, "Discovery filters and catalog search are not library tools")
+            }
+            let table = try XCTUnwrap(views.compactMap { $0 as? UITableView }.first)
+            XCTAssertNil(table.refreshControl)
+            if mode == .search {
+                let search = try XCTUnwrap(views.compactMap { $0 as? UISearchBar }.first)
+                XCTAssertFalse(search.isHidden)
+                XCTAssertGreaterThan(search.bounds.height, 0)
+                XCTAssertEqual(search.accessibilityIdentifier, "qobuz.search.search")
+            } else {
+                let status = try XCTUnwrap(views.first { $0.accessibilityIdentifier == "qobuz.discover.status" } as? UILabel)
+                waitForMainCondition("mocked discovery completes without live configuration requests") {
+                    lock.lock(); let count = requestCount; lock.unlock()
+                    return count == 3 && status.text != "Loading Qobuz discovery…"
+                }
+            }
+        }
+        drainMainQueue()
     }
 
     func testProfileTopTrackSelectionAndActionsUseTrackSection() throws {
@@ -691,6 +1155,36 @@ final class DataLayerTests: XCTestCase {
         }
     }
 
+    func testContentEdgeTabSwipeDirectionHonorsHistoricalEdgesAndThresholds() {
+        for width: CGFloat in [320, 375] {
+            for left in [CGFloat(0), 12, 24] {
+                XCTAssertEqual(EdgeTabSwipeCoordinator.resolvedDirection(startX: left, width: width, translation: CGPoint(x: 46, y: 0)), .previous)
+                XCTAssertNil(EdgeTabSwipeCoordinator.resolvedDirection(startX: left, width: width, translation: CGPoint(x: -100, y: 0)), "Outward left-edge motion is not tab navigation")
+            }
+            for right in [width - 24, width - 12, width] {
+                XCTAssertEqual(EdgeTabSwipeCoordinator.resolvedDirection(startX: right, width: width, translation: CGPoint(x: -46, y: 0)), .next)
+                XCTAssertNil(EdgeTabSwipeCoordinator.resolvedDirection(startX: right, width: width, translation: CGPoint(x: 100, y: 0)), "Outward right-edge motion is not tab navigation")
+            }
+            for interior in [CGFloat(25), width / 2, width - 25] {
+                XCTAssertNil(EdgeTabSwipeCoordinator.resolvedDirection(startX: interior, width: width, translation: CGPoint(x: 200, y: 0)), "Interior gestures belong to rows, not tabs")
+                XCTAssertNil(EdgeTabSwipeCoordinator.resolvedDirection(startX: interior, width: width, translation: CGPoint(x: -200, y: 0)))
+            }
+            for distance: CGFloat in [0, 20, 45] {
+                XCTAssertNil(EdgeTabSwipeCoordinator.resolvedDirection(startX: 0, width: width, translation: CGPoint(x: distance, y: 0)))
+                XCTAssertNil(EdgeTabSwipeCoordinator.resolvedDirection(startX: width, width: width, translation: CGPoint(x: -distance, y: 0)))
+            }
+            for vertical: CGFloat in [-100, -60, 60, 100] {
+                XCTAssertNil(EdgeTabSwipeCoordinator.resolvedDirection(startX: 0, width: width, translation: CGPoint(x: 60, y: vertical)), "Vertical or diagonal scrolling must not switch tabs")
+                XCTAssertNil(EdgeTabSwipeCoordinator.resolvedDirection(startX: width, width: width, translation: CGPoint(x: -60, y: vertical)))
+            }
+            XCTAssertNil(EdgeTabSwipeCoordinator.resolvedDirection(startX: -1, width: width, translation: CGPoint(x: 100, y: 0)))
+            XCTAssertNil(EdgeTabSwipeCoordinator.resolvedDirection(startX: width + 1, width: width, translation: CGPoint(x: -100, y: 0)))
+        }
+        for width: CGFloat in [0, 24, 48] {
+            XCTAssertNil(EdgeTabSwipeCoordinator.resolvedDirection(startX: 0, width: width, translation: CGPoint(x: 100, y: 0)))
+        }
+    }
+
     func testFiveTabStripFitsOrScrollsWithoutSqueezingLabelsAndSelectsTracks() throws {
         let tabs = TabConfiguration().enabledTabs
         XCTAssertEqual(tabs, [.discover, .search, .albums, .artists, .tracks])
@@ -744,6 +1238,349 @@ final class DataLayerTests: XCTestCase {
             XCTAssertTrue(tracksButton.accessibilityTraits.contains(.selected))
             XCTAssertTrue(buttons.dropLast().allSatisfy { !$0.accessibilityTraits.contains(.selected) })
         }
+    }
+
+    func testQueueArtworkUsesHeaderAndRowSizedCacheAndLoadsOnlyDisplayedCells() throws {
+        XCTAssertTrue(URLProtocol.registerClass(UnexpectedArtworkURLProtocol.self))
+        defer { URLProtocol.unregisterClass(UnexpectedArtworkURLProtocol.self); ArtworkImagePipeline.shared.removeAll() }
+        for size in [CGSize(width: 320, height: 568), CGSize(width: 375, height: 667)] {
+            let url = artworkTestURL("queue-sized")
+            let headerImage = preloadArtwork(url: url, pointSize: 62, color: .blue)
+            let rowImage = preloadArtwork(url: url, pointSize: 60, color: .green)
+            let tracks = (0..<80).map { index in
+                ScreenTrack(id: "\(index)", title: "Queue Song \(index)", artist: "Ada Rivers", album: "Queue Album", artworkURL: url, duration: 215)
+            }
+            let controller = QueueViewController(tracks: tracks, currentIndex: 0)
+            layout(controller, size: size)
+            let table = try queueTable(controller)
+            let header = try XCTUnwrap(table.tableHeaderView)
+            header.layoutIfNeeded()
+            let headerArt = try XCTUnwrap(descendants(of: header).compactMap { $0 as? UIImageView }.first { $0.bounds.width == 62 })
+            XCTAssertEqual(headerArt.bounds.height, 62, accuracy: 0.5)
+            XCTAssertTrue(headerArt.image === headerImage, "Current cover has its own 62 pt cache key")
+            XCTAssertEqual(table.numberOfRows(inSection: 0), 79)
+            XCTAssertGreaterThan(table.visibleCells.count, 0)
+            XCTAssertLessThan(table.visibleCells.count, 10, "Long queues must not instantiate all artwork views")
+            for cell in table.visibleCells {
+                cell.layoutIfNeeded()
+                let art = try queueRowArtwork(cell)
+                XCTAssertEqual(art.bounds.width, 60, accuracy: 0.5)
+                XCTAssertEqual(art.bounds.height, 60, accuracy: 0.5)
+                XCTAssertTrue(art.image === rowImage, "Visible rows use 60 pt, not player/header/unsized artwork")
+            }
+            retainVisualCapture(controller.view, name: "Queue sized covers \(Int(size.width))")
+
+            // Simulate UIKit prefetch creating a cell without displaying it.
+            // A synchronous cache hit is deliberately available: configuring
+            // metadata alone must still leave the offscreen image unretained.
+            let path = IndexPath(row: 55, section: 0)
+            let offscreen = controller.tableView(table, cellForRowAt: path)
+            let offscreenArt = try queueRowArtwork(offscreen)
+            XCTAssertNil(offscreenArt.image, "No decoded cover is retained by an undisplayed row")
+            controller.tableView(table, willDisplay: offscreen, forRowAt: path)
+            XCTAssertTrue(offscreenArt.image === rowImage)
+            controller.tableView(table, didEndDisplaying: offscreen, forRowAt: path)
+            XCTAssertNil(offscreenArt.image, "Leaving the viewport releases the row's decoded cover")
+            controller.tableView(table, willDisplay: offscreen, forRowAt: path)
+            XCTAssertTrue(offscreenArt.image === rowImage, "Redisplay can load the cached cover again")
+            offscreen.prepareForReuse()
+            XCTAssertNil(offscreenArt.image)
+            let swipeCell = try XCTUnwrap(offscreen as? SongSwipeActionCell)
+            XCTAssertNil(swipeCell.onLongPress)
+            XCTAssertNil(swipeCell.onSwipeAction)
+        }
+    }
+
+    func testQueueOffscreenArtworkDoesNotRequestUntilWillDisplay() throws {
+        XCTAssertTrue(URLProtocol.registerClass(ControlledArtworkURLProtocol.self))
+        defer {
+            ControlledArtworkURLProtocol.reset()
+            URLProtocol.unregisterClass(ControlledArtworkURLProtocol.self)
+            ArtworkImagePipeline.shared.removeAll()
+        }
+        let url = artworkTestURL("queue-lazy")
+        // All initially visible tracks use local/no artwork. Only the distant
+        // track has a URL, so any observed request before willDisplay is eager.
+        var tracks = (0..<80).map { ScreenTrack(id: "\($0)", title: "Song \($0)", artist: "Ada Rivers", album: "Queue") }
+        tracks[56] = ScreenTrack(id: "56", title: "Distant Song", artist: "Ada Rivers", album: "Queue", artworkURL: url)
+        let controller = QueueViewController(tracks: tracks, currentIndex: 0)
+        layout(controller, size: CGSize(width: 320, height: 568))
+        let table = try queueTable(controller)
+        let path = IndexPath(row: 55, section: 0)
+        let cell = controller.tableView(table, cellForRowAt: path)
+        let art = try queueRowArtwork(cell)
+        drainMainQueue()
+        XCTAssertTrue(ControlledArtworkURLProtocol.requestedURLs.isEmpty)
+        XCTAssertNil(art.image)
+        controller.tableView(table, willDisplay: cell, forRowAt: path)
+        controller.tableView(table, willDisplay: cell, forRowAt: path)
+        waitForMainCondition("display starts one intercepted request") { ControlledArtworkURLProtocol.hasPending(url) }
+        XCTAssertEqual(ControlledArtworkURLProtocol.requestedURLs, [url], "Repeated display must coalesce the size-specific request")
+        let pixels = artworkPixels(60)
+        let delivered = expectation(description: "lazy remote artwork decoded")
+        ArtworkImagePipeline.shared.image(forRemoteURL: url, maximumPixelSize: pixels) { image in
+            XCTAssertNotNil(image)
+            XCTAssertTrue(art.image === image)
+            XCTAssertEqual(image?.cgImage?.width, pixels)
+            delivered.fulfill()
+        }
+        ControlledArtworkURLProtocol.complete(url, data: artworkPNG(color: .green))
+        wait(for: [delivered], timeout: 3)
+        XCTAssertEqual(ControlledArtworkURLProtocol.requestedURLs, [url])
+    }
+
+    func testQueuePendingArtworkCompletionCannotPaintAReusedOrEndedCell() throws {
+        XCTAssertTrue(URLProtocol.registerClass(ControlledArtworkURLProtocol.self))
+        defer {
+            ControlledArtworkURLProtocol.reset()
+            URLProtocol.unregisterClass(ControlledArtworkURLProtocol.self)
+            ArtworkImagePipeline.shared.removeAll()
+        }
+        for reuse in [false, true] {
+            let url = artworkTestURL(reuse ? "queue-reuse" : "queue-ended")
+            let tracks = [
+                ScreenTrack(id: "current", title: "Current Song", artist: "Ada Rivers", album: "Queue"),
+                ScreenTrack(id: "next", title: "Next Song", artist: "Ada Rivers", album: "Queue", artworkURL: url)
+            ]
+            let controller = QueueViewController(tracks: tracks, currentIndex: 0)
+            layout(controller, size: CGSize(width: 375, height: 667))
+            let table = try queueTable(controller)
+            let path = IndexPath(row: 0, section: 0)
+            let cell = try XCTUnwrap(table.cellForRow(at: path))
+            let art = try queueRowArtwork(cell)
+            waitForMainCondition("pending artwork before cancellation") { ControlledArtworkURLProtocol.hasPending(url) }
+            let delivered = expectation(description: "cancelled view's artwork completes in pipeline")
+            ArtworkImagePipeline.shared.image(forRemoteURL: url, maximumPixelSize: artworkPixels(60)) { image in
+                XCTAssertNotNil(image, "The shared cache may finish even after the view stops displaying")
+                XCTAssertNil(art.image, "A cancelled generation must not receive the old decoded image")
+                delivered.fulfill()
+            }
+            if reuse { cell.prepareForReuse() }
+            else { controller.tableView(table, didEndDisplaying: cell, forRowAt: path) }
+            ControlledArtworkURLProtocol.complete(url, data: artworkPNG(color: .red))
+            wait(for: [delivered], timeout: 3)
+            XCTAssertNil(art.image)
+        }
+    }
+
+    func testQueueSameIDNewArtworkURLRejectsOldCompletionAndKeepsVisibleRow() throws {
+        XCTAssertTrue(URLProtocol.registerClass(ControlledArtworkURLProtocol.self))
+        defer {
+            ControlledArtworkURLProtocol.reset()
+            URLProtocol.unregisterClass(ControlledArtworkURLProtocol.self)
+            ArtworkImagePipeline.shared.removeAll()
+        }
+        let oldURL = artworkTestURL("queue-old")
+        let newURL = artworkTestURL("queue-new")
+        let current = ScreenTrack(id: "current", title: "Current Song", artist: "Ada Rivers", album: "Queue")
+        let old = ScreenTrack(id: "next", title: "Old Song", artist: "Ada Rivers", album: "Queue", artworkURL: oldURL, duration: 120)
+        let updated = ScreenTrack(id: old.id, title: "Updated Song", artist: "New Artist", album: "Queue", artworkURL: newURL, duration: 215)
+        let newImage = preloadArtwork(url: newURL, pointSize: 60, color: .green)
+        let controller = QueueViewController(tracks: [current, old], currentIndex: 0)
+        layout(controller, size: CGSize(width: 375, height: 667))
+        let table = try queueTable(controller)
+        let path = IndexPath(row: 0, section: 0)
+        let cell = try XCTUnwrap(table.cellForRow(at: path) as? SongSwipeActionCell)
+        let art = try queueRowArtwork(cell)
+        let header = try XCTUnwrap(table.tableHeaderView)
+        waitForMainCondition("old artwork is pending") { ControlledArtworkURLProtocol.hasPending(oldURL) }
+        let delivered = expectation(description: "old URL completes after same-ID metadata update")
+        ArtworkImagePipeline.shared.image(forRemoteURL: oldURL, maximumPixelSize: artworkPixels(60)) { image in
+            XCTAssertNotNil(image)
+            XCTAssertTrue(art.image === newImage, "Same-ID old-URL completion must not overwrite the new cover")
+            delivered.fulfill()
+        }
+        var navigated: [ScreenTrack] = []
+        controller.onTrackNavigationRequested = { navigated.append($0) }
+        controller.update(tracks: [current, updated], currentIndex: 0)
+        XCTAssertTrue(table.cellForRow(at: path) === cell, "Metadata-only changes update visible cells in place")
+        XCTAssertTrue(table.tableHeaderView === header, "An upcoming track change must not rebuild Now Playing")
+        XCTAssertTrue(art.image === newImage)
+        XCTAssertTrue(descendants(of: cell).compactMap { $0 as? UILabel }.contains { $0.text == "Updated Song" })
+        XCTAssertTrue(descendants(of: cell).compactMap { $0 as? UILabel }.contains { $0.text == "New Artist · 3:35" })
+        cell.onLongPress?()
+        XCTAssertEqual(navigated.first?.title, "Updated Song", "Reconfigured callbacks must capture the updated metadata")
+        ControlledArtworkURLProtocol.complete(oldURL, data: artworkPNG(color: .red))
+        wait(for: [delivered], timeout: 3)
+        XCTAssertTrue(art.image === newImage)
+        XCTAssertEqual(ControlledArtworkURLProtocol.requestedURLs, [oldURL], "The new size-specific cache hit must not request")
+    }
+
+    func testQueueMetadataGatePreservesHeaderRowsScrollAndSwipeUntilPresentationChanges() throws {
+        let current = ScreenTrack(id: "current", title: "Current Song", artist: "Ada Rivers", album: "Queue", duration: 120)
+        let upcoming = (0..<30).map { ScreenTrack(id: "next-\($0)", title: "Next Song \($0)", artist: "Ada Rivers", album: "Queue", duration: 215) }
+        let controller = QueueViewController(tracks: [current] + upcoming, currentIndex: 0)
+        layout(controller, size: CGSize(width: 320, height: 568))
+        let table = try queueTable(controller)
+        table.setContentOffset(CGPoint(x: 0, y: 220), animated: false)
+        table.layoutIfNeeded()
+        let path = try XCTUnwrap(table.indexPathsForVisibleRows?.first)
+        let cell = try XCTUnwrap(table.cellForRow(at: path) as? SongSwipeActionCell)
+        let header = try XCTUnwrap(table.tableHeaderView)
+        cell.updateSwipe(translation: 40)
+        let offset = table.contentOffset
+        let transform = cell.contentView.transform
+        // Fresh equivalent value structs must also pass the presentation gate.
+        for _ in 0..<4 {
+            let sameCurrent = ScreenTrack(id: current.id, title: current.title, artist: current.artist, album: current.album, duration: current.duration)
+            controller.update(tracks: [sameCurrent] + upcoming, currentIndex: 0)
+        }
+        XCTAssertTrue(table.tableHeaderView === header)
+        XCTAssertTrue(table.cellForRow(at: path) === cell)
+        XCTAssertEqual(table.contentOffset, offset)
+        XCTAssertEqual(cell.contentView.transform, transform, "No-op updates must not interrupt a swipe")
+        let edited = ScreenTrack(id: current.id, title: "Renamed Current Song", artist: "New Artist", album: "Queue", duration: 180)
+        controller.update(tracks: [edited] + upcoming, currentIndex: 0)
+        XCTAssertFalse(table.tableHeaderView === header, "Same-ID current metadata changes must refresh the header")
+        let changedHeader = try XCTUnwrap(table.tableHeaderView)
+        XCTAssertTrue(descendants(of: changedHeader).compactMap { $0 as? UILabel }.contains { $0.text == edited.title })
+        XCTAssertTrue(table.cellForRow(at: path) === cell)
+        XCTAssertEqual(table.contentOffset, offset)
+        XCTAssertEqual(cell.contentView.transform, transform)
+    }
+
+    func testRootPlayerToQueuePreservesUnavailablePositionsAndSkipsMetadataWorkOnPlaybackTicks() throws {
+        // Root normally opens the user's catalog, which may be authenticated.
+        // Temporarily choose the inert settings screen instead; restore every
+        // touched preference and never mutate the credentials store.
+        let defaults = UserDefaults.standard
+        let preferenceKeys = ["Music.AppState.tabConfiguration", "Music.AppState.queueState"]
+        let savedPreferences = preferenceKeys.map { defaults.object(forKey: $0) }
+        let oldKeyWindow = UIApplication.shared.windows.first { $0.isKeyWindow }
+        let animationsEnabled = UIView.areAnimationsEnabled
+        UIView.setAnimationsEnabled(false)
+        defaults.set(Data(#"{"enabledTabs":["settings"],"libraryTabsVersion":1}"#.utf8), forKey: preferenceKeys[0])
+        XCTAssertTrue(URLProtocol.registerClass(UnexpectedArtworkURLProtocol.self))
+        defer {
+            for (key, value) in zip(preferenceKeys, savedPreferences) {
+                if let value = value { defaults.set(value, forKey: key) }
+                else { defaults.removeObject(forKey: key) }
+            }
+            UIView.setAnimationsEnabled(animationsEnabled)
+            oldKeyWindow?.makeKey()
+            URLProtocol.unregisterClass(UnexpectedArtworkURLProtocol.self)
+            ArtworkImagePipeline.shared.removeAll()
+        }
+        for size in [CGSize(width: 320, height: 568), CGSize(width: 375, height: 667)] {
+            let currentURL = artworkTestURL("root-current")
+            let upcomingURL = artworkTestURL("root-upcoming")
+            let current = ScreenTrack(id: "current", title: "Current Song", artist: "Ada Rivers", album: "Player Album", artworkURL: currentURL, duration: 215)
+            let upcoming = ScreenTrack(id: "upcoming", title: "Known Upcoming Song", artist: "Ada Rivers", album: "Queue Album", artworkURL: upcomingURL, duration: 180)
+            var providerCalls: [String] = []
+            let backend = StubPresentationPlayback()
+            let root = RootViewController(playbackBackend: backend, presentationTrackProvider: { id in
+                providerCalls.append(id)
+                return id == current.id ? current : (id == upcoming.id ? upcoming : nil)
+            })
+            let window = UIWindow(frame: CGRect(origin: .zero, size: size))
+            window.rootViewController = root
+            window.makeKeyAndVisible()
+            layout(root, size: size)
+            defer {
+                root.dismiss(animated: false)
+                window.isHidden = true
+                window.rootViewController = nil
+                backend.onStateChange = nil
+            }
+            // Root's player loader uses root width; the queue uses only 62/60.
+            let playerImage = preloadArtwork(url: currentURL, pointSize: root.view.bounds.width, color: .blue)
+            let headerImage = preloadArtwork(url: currentURL, pointSize: 62, color: .green)
+            let rowImage = preloadArtwork(url: upcomingURL, pointSize: 60, color: .orange)
+            _ = preloadArtwork(url: upcomingURL, pointSize: root.view.bounds.width, color: .orange)
+            _ = preloadArtwork(url: upcomingURL, pointSize: 62, color: .orange)
+            let ids = [current.id, "missing", upcoming.id]
+            backend.emit(QueueState(trackIDs: ids, currentIndex: 0, elapsed: 15, isPlaying: true))
+            let mini = try XCTUnwrap(descendants(of: root.view).compactMap { $0 as? MiniPlayerView }.first)
+            XCTAssertEqual(mini.titleLabel.text, current.title)
+            XCTAssertTrue(mini.artworkImageView.image === playerImage)
+            mini.onOpenPlayer?()
+            waitForMainCondition("root presents injected current player") { root.presentedViewController is PlayerViewController }
+            let player = try XCTUnwrap(root.presentedViewController as? PlayerViewController)
+            layout(player, size: size)
+            XCTAssertTrue(descendants(of: player.view).compactMap { $0 as? UILabel }.contains { $0.text == current.title })
+            XCTAssertTrue(descendants(of: player.view).compactMap { $0 as? UIImageView }.contains { $0.image === playerImage })
+            retainVisualCapture(player.view, name: "Injected root player \(Int(size.width))")
+            player.onOpenQueue?()
+            waitForMainCondition("player presents positional queue") { player.presentedViewController is QueueViewController }
+            let queue = try XCTUnwrap(player.presentedViewController as? QueueViewController)
+            layout(queue, size: size)
+            let table = try queueTable(queue)
+            let header = try XCTUnwrap(table.tableHeaderView)
+            XCTAssertEqual(table.numberOfRows(inSection: 0), 2, "An unresolved ID must remain a row, not shift subsequent selections")
+            let missingCell = try XCTUnwrap(table.cellForRow(at: IndexPath(row: 0, section: 0)))
+            let knownCell = try XCTUnwrap(table.cellForRow(at: IndexPath(row: 1, section: 0)) as? SongSwipeActionCell)
+            XCTAssertTrue(descendants(of: missingCell).compactMap { $0 as? UILabel }.contains { $0.text == "Unavailable Track" })
+            XCTAssertTrue(try queueRowArtwork(knownCell).image === rowImage)
+            XCTAssertTrue(descendants(of: header).compactMap { $0 as? UIImageView }.contains { $0.image === headerImage })
+            retainVisualCapture(queue.view, name: "Root player to queue \(Int(size.width))")
+            knownCell.updateSwipe(translation: 40)
+            let transform = knownCell.contentView.transform
+            let offset = table.contentOffset
+            providerCalls.removeAll()
+            for elapsed in [16.0, 17.0, 18.0, 19.0] {
+                backend.emit(QueueState(trackIDs: ids, currentIndex: 0, elapsed: elapsed, isPlaying: elapsed != 18))
+            }
+            XCTAssertFalse(providerCalls.contains("missing"), "Elapsed/play-pause ticks must not rebuild queue presentation metadata")
+            XCTAssertFalse(providerCalls.contains(upcoming.id), "Only current player metadata is needed on playback ticks")
+            XCTAssertTrue(table.tableHeaderView === header)
+            XCTAssertTrue(table.cellForRow(at: IndexPath(row: 1, section: 0)) === knownCell)
+            XCTAssertEqual(knownCell.contentView.transform, transform)
+            XCTAssertEqual(table.contentOffset, offset)
+            queue.tableView(table, didSelectRowAt: IndexPath(row: 1, section: 0))
+            XCTAssertEqual(backend.selections.last, 2, "The known row after an unresolved ID must select the original queue position")
+            XCTAssertEqual(backend.queueState.currentTrackID, upcoming.id)
+            XCTAssertTrue(backend.queueState.isPlaying, "Selecting an upcoming row preserves active transport")
+            waitForMainCondition("queue selection dismisses queue back to player") { player.presentedViewController == nil }
+            let dismissed = expectation(description: "root regression modal cleanup")
+            root.dismiss(animated: false) { dismissed.fulfill() }
+            wait(for: [dismissed], timeout: 3)
+        }
+    }
+
+    private func artworkTestURL(_ prefix: String) -> URL {
+        URL(string: "https://artwork-regression.invalid/\(prefix)-\(UUID().uuidString).png")!
+    }
+
+    private func artworkPixels(_ pointSize: CGFloat) -> Int {
+        max(1, Int(ceil(pointSize * UIScreen.main.scale)))
+    }
+
+    private func artworkPNG(color: UIColor) -> Data {
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        let image = UIGraphicsImageRenderer(size: CGSize(width: 512, height: 512), format: format).image { context in
+            color.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 512, height: 512))
+        }
+        return image.pngData()!
+    }
+
+    private func queueTable(_ controller: QueueViewController) throws -> UITableView {
+        try XCTUnwrap(controller.view.subviews.compactMap { $0 as? UITableView }.first)
+    }
+
+    private func queueRowArtwork(_ cell: UITableViewCell) throws -> UIImageView {
+        try XCTUnwrap(descendants(of: cell.contentView).compactMap { $0 as? UIImageView }.first)
+    }
+
+    private func assertGroupedAccessibility(_ view: UIView, contains values: [String], file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertTrue(view.isAccessibilityElement, "The whole card/row is the VoiceOver focus target", file: file, line: line)
+        for value in values {
+            XCTAssertTrue(view.accessibilityLabel?.contains(value) == true, "Grouped label must include \(value)", file: file, line: line)
+        }
+    }
+
+    private func retainVisualCapture(_ view: UIView, name: String) {
+        view.layoutIfNeeded()
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        let image = UIGraphicsImageRenderer(size: view.bounds.size, format: format).image { context in
+            view.layer.render(in: context.cgContext)
+        }
+        let attachment = XCTAttachment(image: image)
+        attachment.name = name
+        attachment.lifetime = .keepAlways
+        add(attachment)
     }
 
     private func layout(_ controller: UIViewController, size: CGSize) {
