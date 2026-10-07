@@ -311,7 +311,7 @@ final class RootViewController: UIViewController {
         switch tab {
         case .discover, .search:
             guard let credentials = QobuzCredentialStore.shared.load() else {
-                return QobuzWelcomeViewController(onSignIn: { [weak self] in self?.open(tab: .settings, direction: nil) })
+                return QobuzWelcomeViewController(onSignIn: { [weak self] in self?.showQobuzStreamTest(autoStartSignIn: true) })
             }
             let mode: QobuzCatalogViewController.Mode = tab == .discover ? .discover : .search
             let catalog = QobuzCatalogViewController(mode: mode, client: QobuzStreamingClient(credentials: credentials))
@@ -332,7 +332,7 @@ final class RootViewController: UIViewController {
             return catalog
         case .albums, .artists:
             guard let credentials = QobuzCredentialStore.shared.load() else {
-                return QobuzWelcomeViewController(onSignIn: { [weak self] in self?.open(tab: .settings, direction: nil) })
+                return QobuzWelcomeViewController(onSignIn: { [weak self] in self?.showQobuzStreamTest(autoStartSignIn: true) })
             }
             let mode: QobuzCatalogViewController.Mode = tab == .albums ? .albums : .artists
             let catalog = QobuzCatalogViewController(mode: mode, client: QobuzStreamingClient(credentials: credentials))
@@ -902,7 +902,7 @@ final class RootViewController: UIViewController {
 
     private func handleQobuzAccountAction() {
         guard QobuzCredentialStore.shared.load() != nil else {
-            showQobuzStreamTest()
+            showQobuzStreamTest(autoStartSignIn: true)
             return
         }
         let alert = UIAlertController(title: "Qobuz Account", message: "Sign out of Qobuz on this device?", preferredStyle: .actionSheet)
@@ -920,11 +920,14 @@ final class RootViewController: UIViewController {
         presenter.present(alert, animated: true)
     }
 
-    private func showQobuzStreamTest() {
+    private func showQobuzStreamTest(autoStartSignIn: Bool = false) {
         let controller = QobuzAccountViewController()
+        controller.startsSignInAutomatically = autoStartSignIn
         controller.onAccountChanged = { [weak self] in
-            self?.tabControllers.removeAll()
-            self?.open(tab: .discover, direction: nil)
+            guard let self = self else { return }
+            let returnTab = self.appState.currentTab
+            self.tabControllers.removeAll()
+            self.open(tab: returnTab, direction: nil)
         }
         controller.modalPresentationStyle = .fullScreen
         present(controller, animated: true)

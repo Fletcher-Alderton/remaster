@@ -142,6 +142,7 @@ enum QobuzStreamingError: LocalizedError {
     case invalidResponse
     case notAuthenticated
     case appIDNotFound
+    case appIDDiscoveryFailed(stage: String, details: String)
     case secretsNotFound
     case resolutionTimedOut
     case secretProbesFailed(count: Int, lastError: String)
@@ -159,6 +160,8 @@ enum QobuzStreamingError: LocalizedError {
         case .invalidResponse: return "Qobuz returned an invalid response."
         case .notAuthenticated: return "Sign in to Qobuz before queueing music."
         case .appIDNotFound: return "Could not find the Qobuz web player app ID."
+        case .appIDDiscoveryFailed(let stage, let details):
+            return "Could not find the Qobuz web player app ID.\nStage: \(stage)\n\(details)"
         case .secretsNotFound: return "Could not find the active Qobuz signing secret."
         case .resolutionTimedOut: return "Qobuz stream resolution timed out. Check your connection and try again."
         case .secretProbesFailed(let count, let lastError):
@@ -751,37 +754,159 @@ final class QobuzStreamingClient: QobuzStreamResolving {
             completion(.success(WebPlayerInfo(appID: cached.appID, secrets: cached.secrets, activeSecret: cached.activeSecret)))
             return
         }
+        Self.discoverWebPlayerConfiguration(session: session) { result in
+            switch result {
+            case .failure(let error): completion(.failure(error))
+            case .success(let configuration):
+                QobuzWebPlayerCache.save(appID: configuration.appID, secrets: configuration.secrets)
+                completion(.success(WebPlayerInfo(
+                    appID: configuration.appID,
+                    secrets: configuration.secrets,
+                    activeSecret: nil
+                )))
+            }
+        }
+    }
+
+    static func discoverWebPlayerConfiguration(
+        session: URLSession = .shared,
+        completion: @escaping (Result<(appID: String, secrets: [String]), Error>) -> Void
+    ) {
         var request = URLRequest(url: Self.playBase.appendingPathComponent("login"))
         request.timeoutInterval = Self.requestTimeout
-        session.dataTask(with: request) { [weak self] data, _, error in
-            guard let self = self else { return }
+        session.dataTask(with: request) { data, response, error in
             if let error = error { completion(.failure(error)); return }
-            guard let data = data, let html = String(data: data, encoding: .utf8),
-                  let bundlePath = Self.firstCapture(
-                    pattern: #"<script src="(/resources/\d+\.\d+\.\d+-[a-z0-9]\d{3}/bundle\.js)"></script>"#,
-                    in: html
-                  ) else {
-                completion(.failure(QobuzStreamingError.appIDNotFound))
+            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                completion(.failure(Self.appIDDiscoveryError(
+                    stage: "Qobuz login page HTTP response",
+                    response: response,
+                    data: data,
+                    isBundle: false
+                )))
+                return
+            }
+            guard let data = data, let html = String(data: data, encoding: .utf8) else {
+                completion(.failure(Self.appIDDiscoveryError(
+                    stage: "reading Qobuz login page",
+                    response: response,
+                    data: data,
+                    isBundle: false
+                )))
+                return
+            }
+            guard let bundlePath = Self.firstCapture(
+                pattern: #"<script src="(/resources/\d+\.\d+\.\d+-[a-z0-9]\d{3}/bundle\.js)"></script>"#,
+                in: html
+            ) else {
+                completion(.failure(Self.appIDDiscoveryError(
+                    stage: "finding the player bundle in Qobuz login HTML",
+                    response: response,
+                    data: data,
+                    isBundle: false
+                )))
                 return
             }
             let bundleURL = Self.playBase.appendingPathComponent(String(bundlePath.dropFirst()))
             var bundleRequest = URLRequest(url: bundleURL)
             bundleRequest.timeoutInterval = Self.requestTimeout
-            self.session.dataTask(with: bundleRequest) { bundleData, _, bundleError in
+            session.dataTask(with: bundleRequest) { bundleData, bundleResponse, bundleError in
                 if let bundleError = bundleError { completion(.failure(bundleError)); return }
-                guard let bundleData = bundleData, let script = String(data: bundleData, encoding: .utf8),
-                      let appID = Self.firstCapture(
-                        pattern: #"production:\{api:\{appId:"(\d{9})",appSecret:"\w{32}""#,
-                        in: script
-                      ) else {
-                    completion(.failure(QobuzStreamingError.appIDNotFound))
+                guard let http = bundleResponse as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                    completion(.failure(Self.appIDDiscoveryError(
+                        stage: "Qobuz player bundle HTTP response",
+                        response: bundleResponse,
+                        data: bundleData,
+                        isBundle: true
+                    )))
+                    return
+                }
+                guard let bundleData = bundleData, let script = String(data: bundleData, encoding: .utf8) else {
+                    completion(.failure(Self.appIDDiscoveryError(
+                        stage: "reading Qobuz player JavaScript bundle",
+                        response: bundleResponse,
+                        data: bundleData,
+                        isBundle: true
+                    )))
+                    return
+                }
+                guard let appID = Self.firstCapture(
+                    pattern: #"production:\{api:\{appId:"(\d{9})",appSecret:"\w{32}""#,
+                    in: script
+                ) else {
+                    completion(.failure(Self.appIDDiscoveryError(
+                        stage: "finding the app ID in Qobuz player JavaScript",
+                        response: bundleResponse,
+                        data: bundleData,
+                        isBundle: true
+                    )))
                     return
                 }
                 let secrets = Self.extractTimezoneSecrets(from: script)
-                QobuzWebPlayerCache.save(appID: appID, secrets: secrets)
-                completion(.success(WebPlayerInfo(appID: appID, secrets: secrets, activeSecret: nil)))
+                completion(.success((appID: appID, secrets: secrets)))
             }.resume()
         }.resume()
+    }
+
+    private static func appIDDiscoveryError(
+        stage: String,
+        response: URLResponse?,
+        data: Data?,
+        isBundle: Bool
+    ) -> QobuzStreamingError {
+        let httpStatus = (response as? HTTPURLResponse).map { String($0.statusCode) } ?? "unavailable"
+        let responseURL = response?.url.map { "\($0.host ?? "unknown host")\($0.path)" } ?? "unavailable"
+        let contentType = response?.mimeType ?? "unknown"
+        let byteCount = data?.count ?? 0
+        let preview = responsePreview(data, contentType: contentType, isBundle: isBundle)
+        let details = [
+            "HTTP status: \(httpStatus)",
+            "URL: \(responseURL)",
+            "Content type: \(contentType)",
+            "Response size: \(byteCount) bytes",
+            "Response details: \(preview)"
+        ].joined(separator: "\n")
+        return .appIDDiscoveryFailed(stage: stage, details: details)
+    }
+
+    private static func responsePreview(_ data: Data?, contentType: String, isBundle: Bool) -> String {
+        guard let data = data else { return "No response body." }
+        guard let body = String(data: data, encoding: .utf8) else { return "Response body is not UTF-8 text." }
+        let looksLikeHTML = contentType.localizedCaseInsensitiveContains("html")
+            || body.range(of: #"(?is)<(?:!doctype\s+html|html\b|title\b|body\b)"#, options: .regularExpression) != nil
+
+        if isBundle && !looksLikeHTML {
+            let hasAppIDMarker = body.range(of: "appId", options: .caseInsensitive) != nil
+            let hasProductionMarker = body.range(of: "production", options: .caseInsensitive) != nil
+            let hasAppSecretMarker = body.range(of: "appSecret", options: .caseInsensitive) != nil
+            return "JavaScript markers — appId: \(hasAppIDMarker ? "present" : "absent"), production: \(hasProductionMarker ? "present" : "absent"), appSecret: \(hasAppSecretMarker ? "present" : "absent"). Script content omitted to protect signing secrets."
+        }
+
+        let title = firstCapture(pattern: #"(?is)<title\b[^>]*>(.*?)</title\s*>"#, in: body)
+        var visibleText = body
+        for pattern in [#"(?is)<script\b[^>]*>.*?</script\s*>"#, #"(?is)<style\b[^>]*>.*?</style\s*>"#, #"(?is)<input\b[^>]*>"#] {
+            visibleText = visibleText.replacingOccurrences(of: pattern, with: " ", options: .regularExpression)
+        }
+        visibleText = visibleText.replacingOccurrences(of: #"<[^>]+>"#, with: " ", options: .regularExpression)
+        visibleText = redactSensitiveValues(in: visibleText)
+        let textPreview = String(visibleText.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }.joined(separator: " ").prefix(280))
+        let safeTitle = title.map { String(redactSensitiveValues(in: $0).prefix(100)) }
+        let bundleReference = firstCapture(
+            pattern: #"(?is)<script\b[^>]*\bsrc\s*=\s*["']([^"']*bundle\.js[^"']*)["'][^>]*>"#,
+            in: body
+        )?.components(separatedBy: "?").first.map { "player bundle reference: \($0)" }
+        let details = [
+            safeTitle.map { "title: \($0)" },
+            bundleReference,
+            textPreview.isEmpty ? nil : "page text: \(textPreview)"
+        ]
+        .compactMap { $0 }
+        .joined(separator: "; ")
+        return details.isEmpty ? "No visible page text." : details
+    }
+
+    private static func redactSensitiveValues(in text: String) -> String {
+        let pattern = #"(?i)\b(appsecret|access[-_]?token|user[-_]?auth[-_]?token|token|secret|password|authorization|cookie|csrf)\b["']?\s*[:=]\s*["']?[^"'\s<>,;&}]+["']?"#
+        return text.replacingOccurrences(of: pattern, with: "$1=[redacted]", options: .regularExpression)
     }
 
     private func findActiveSecret(

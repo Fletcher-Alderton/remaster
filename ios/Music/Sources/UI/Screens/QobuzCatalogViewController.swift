@@ -43,7 +43,7 @@ final class QobuzCatalogViewController: UIViewController, UITableViewDataSource,
         statusLabel.font = DesignSystem.font(11)
         statusLabel.textColor = DesignSystem.secondaryText
         statusLabel.textAlignment = .center
-        statusLabel.numberOfLines = 2
+        statusLabel.numberOfLines = 0
         table.translatesAutoresizingMaskIntoConstraints = false
         table.backgroundColor = DesignSystem.pageBackground
         table.separatorColor = DesignSystem.separator

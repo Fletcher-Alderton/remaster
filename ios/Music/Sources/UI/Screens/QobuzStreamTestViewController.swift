@@ -256,31 +256,21 @@ final class QobuzStreamTestViewController: UIViewController, UITextFieldDelegate
             return
         }
         statusLabel.text = "Finding Qobuz sign-in…"
-        URLSession.shared.dataTask(with: URL(string: "https://play.qobuz.com/login")!) { [weak self] data, _, error in
-            if let error = error { DispatchQueue.main.async { self?.showError(error) }; return }
-            guard let data = data, let html = String(data: data, encoding: .utf8),
-                  let bundlePath = QobuzStreamingClient.firstCapture(
-                    pattern: #"<script src="(/resources/\d+\.\d+\.\d+-[a-z0-9]\d{3}/bundle\.js)"></script>"#,
-                    in: html
-                  ) else {
-                DispatchQueue.main.async { self?.showError(QobuzStreamingError.appIDNotFound) }
-                return
-            }
-            let bundleURL = URL(string: "https://play.qobuz.com" + bundlePath)!
-            URLSession.shared.dataTask(with: bundleURL) { bundleData, _, bundleError in
-                if let bundleError = bundleError { DispatchQueue.main.async { self?.showError(bundleError) }; return }
-                guard let bundleData = bundleData, let script = String(data: bundleData, encoding: .utf8),
-                      let appID = QobuzStreamingClient.firstCapture(
-                        pattern: #"production:\{api:\{appId:"(\d{9})",appSecret:"\w{32}""#,
-                        in: script
-                      ),
-                      let url = QobuzStreamingClient.authorizationURL(appID: appID) else {
-                    DispatchQueue.main.async { self?.showError(QobuzStreamingError.appIDNotFound) }
-                    return
+        QobuzStreamingClient.discoverWebPlayerConfiguration { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                switch result {
+                case .failure(let error):
+                    self.showError(error)
+                case .success(let configuration):
+                    guard let url = QobuzStreamingClient.authorizationURL(appID: configuration.appID) else {
+                        self.showError(QobuzStreamingError.invalidResponse)
+                        return
+                    }
+                    self.beginOAuth(url: url, appID: configuration.appID)
                 }
-                DispatchQueue.main.async { self?.beginOAuth(url: url, appID: appID) }
-            }.resume()
-        }.resume()
+            }
+        }
     }
 
     private func beginOAuth(url: URL, appID: String) {
