@@ -155,6 +155,18 @@ enum QobuzStreamingError: LocalizedError {
     case invalidCallback
     case keychain(OSStatus)
 
+    static func catalogRequestFailure(path: String, statusCode: Int, responseData: Data) -> Self {
+        let response = (try? JSONSerialization.jsonObject(with: responseData)) as? [String: Any]
+        let nestedError = response?["error"] as? [String: Any]
+        let rawMessage = (response?["message"] as? String)
+            ?? (response?["error"] as? String)
+            ?? (nestedError?["message"] as? String)
+        let message = rawMessage?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let detail = message.flatMap { $0.isEmpty ? nil : String($0.prefix(240)) }
+        let summary = "Qobuz catalog request to \(path) failed (HTTP \(statusCode))"
+        return .api(detail.map { "\(summary): \($0)" } ?? "\(summary).")
+    }
+
     var errorDescription: String? {
         switch self {
         case .invalidResponse: return "Qobuz returned an invalid response."
@@ -602,16 +614,8 @@ final class QobuzStreamingClient: QobuzStreamResolving {
                     case .success(let albumData):
                         do {
                             let albumPage = try JSONDecoder().decode(QobuzCatalogFeaturedResponse.self, from: albumData).albums
-                            self.performCatalogRequest(path: "artist/getFeatured", queryItems: [
-                                URLQueryItem(name: "limit", value: "25")
-                            ], appID: playerInfo.appID) { artistResult in
-                                completion(artistResult.flatMap { data in
-                                    Result {
-                                        let artists = try JSONDecoder().decode(QobuzCatalogFeaturedResponse.self, from: data).artists
-                                        return QobuzCatalogFeaturedResponse(albums: albumPage, artists: artists)
-                                    }
-                                })
-                            }
+                            let artistPage = QobuzCatalogMapper.featuredArtists(from: albumPage)
+                            completion(.success(QobuzCatalogFeaturedResponse(albums: albumPage, artists: artistPage)))
                         } catch { completion(.failure(error)) }
                     }
                 }
@@ -669,7 +673,11 @@ final class QobuzStreamingClient: QobuzStreamResolving {
                 return
             }
             guard (200..<300).contains(http.statusCode) else {
-                completion(.failure(QobuzStreamingError.api("Qobuz catalog request failed (HTTP \(http.statusCode)).")))
+                completion(.failure(QobuzStreamingError.catalogRequestFailure(
+                    path: path,
+                    statusCode: http.statusCode,
+                    responseData: data
+                )))
                 return
             }
             completion(.success(data))

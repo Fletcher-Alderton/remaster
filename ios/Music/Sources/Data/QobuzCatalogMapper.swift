@@ -12,6 +12,13 @@ enum QobuzCatalogMapper {
         return ScreenAlbum(id: album.id, title: album.title, artist: album.artist?.name ?? "Unknown Artist", year: album.year, genre: album.genre?.name ?? "", quality: album.quality, artworkURL: album.artworkURL, tracks: tracks)
     }
 
+    static func featuredArtists(from albums: QobuzCatalogPage<QobuzCatalogAlbum>?) -> QobuzCatalogPage<QobuzCatalogArtist>? {
+        guard let albums = albums else { return nil }
+        var seenIDs = Set<String>()
+        let artists = albums.items.compactMap(\.artist).filter { seenIDs.insert($0.id).inserted }
+        return QobuzCatalogPage(items: artists, total: artists.count)
+    }
+
     static func profile(_ artist: QobuzCatalogArtist) -> ScreenProfile {
         let albums = (artist.albums?.items ?? []).map(album)
         let biography = artist.biography?.content ?? artist.biography?.summary ?? artist.information ?? "Artist on Qobuz."

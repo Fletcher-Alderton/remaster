@@ -67,12 +67,49 @@ final class DataLayerTests: XCTestCase {
         XCTAssertEqual(result.url.host, "media.example")
     }
 
+    func testQobuzCatalogHTTPErrorIncludesEndpointAndServerMessage() {
+        let response = Data(#"{"message":"Invalid type parameter"}"#.utf8)
+        let error = QobuzStreamingError.catalogRequestFailure(
+            path: "album/getFeatured",
+            statusCode: 400,
+            responseData: response
+        )
+
+        XCTAssertEqual(
+            error.localizedDescription,
+            "Qobuz catalog request to album/getFeatured failed (HTTP 400): Invalid type parameter"
+        )
+    }
+
+    func testQobuzCatalogHTTPErrorFallsBackWithoutResponseMessage() {
+        let error = QobuzStreamingError.catalogRequestFailure(
+            path: "artist/get",
+            statusCode: 400,
+            responseData: Data("not-json".utf8)
+        )
+
+        XCTAssertEqual(
+            error.localizedDescription,
+            "Qobuz catalog request to artist/get failed (HTTP 400)."
+        )
+    }
+
     func testQobuzTrackSearchDecodesResults() throws {
         let json = Data(#"{"tracks":{"items":[{"id":12345,"title":"Example Song","duration":210,"performer":{"name":"Example Artist"},"album":{"title":"Example Album"}}]}}"#.utf8)
         let response = try JSONDecoder().decode(QobuzTrackSearchResponse.self, from: json)
         XCTAssertEqual(response.tracks.items.count, 1)
         XCTAssertEqual(response.tracks.items[0].id, 12345)
         XCTAssertEqual(response.tracks.items[0].subtitle, "Example Artist • Example Album")
+    }
+
+    func testQobuzFeaturedArtistsAreDerivedAndDeduplicatedFromFeaturedAlbums() throws {
+        let json = Data(#"{"albums":{"items":[{"id":"1","title":"First","artist":{"id":"42","name":"Alpha"}},{"id":"2","title":"Second","artist":{"id":42,"name":"Alpha"}},{"id":"3","title":"Third","artist":{"id":"7","name":"Beta"}}],"total":3}}"#.utf8)
+        let response = try JSONDecoder().decode(QobuzCatalogFeaturedResponse.self, from: json)
+        let artists = try XCTUnwrap(QobuzCatalogMapper.featuredArtists(from: response.albums))
+
+        XCTAssertEqual(artists.items.map(\.id), ["42", "7"])
+        XCTAssertEqual(artists.items.map(\.name), ["Alpha", "Beta"])
+        XCTAssertEqual(artists.total, 2)
     }
 
     func testQobuzCatalogSearchFixtureDecodesMixedIDsAndArtworkVariants() throws {
