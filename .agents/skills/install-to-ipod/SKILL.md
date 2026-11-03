@@ -79,7 +79,7 @@ ideviceinstaller list | grep -i music
 ### 2. Build for the device
 
 ```sh
-cd /Users/fletcher/code/prod/ipod-music-app-updated
+cd /Users/fletcher/code/prod/remaster
 
 xcodebuild \
   -project ios/Music/Music.xcodeproj \
