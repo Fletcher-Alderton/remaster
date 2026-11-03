@@ -1,4 +1,4 @@
-# Music for iPod touch
+# remaster
 
 A native UIKit music player for the **iPod touch (6th generation)** running iOS 12.5.8,
 with Qobuz as its catalogue and streaming source.
