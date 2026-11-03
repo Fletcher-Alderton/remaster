@@ -8,7 +8,6 @@
 
 /* Begin PBXBuildFile section */
 		061E3D5327983F9BD985945B /* AccountQualityTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B8F30718F1CBF72CB842B3D4 /* AccountQualityTests.swift */; };
-		0D7D4986CE87C2C0171720D1 /* THIRD_PARTY_NOTICES.md in Resources */ = {isa = PBXBuildFile; fileRef = 03D9C1476B14FA080E084F2E /* THIRD_PARTY_NOTICES.md */; };
 		0DB63228442A2AF673006D88 /* ArtworkImagePipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = 59B07F515BB8F5D59DEDAFDC /* ArtworkImagePipeline.swift */; };
 		10487F2401305CF42D4BEE7D /* EQAudioTap.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F02ACC2458ACF2ABB38E255 /* EQAudioTap.swift */; };
 		16549A2B39B8A9940DAA1A62 /* DownloadIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2F4790159109C9A7E7D15439 /* DownloadIntegrationTests.swift */; };
@@ -30,6 +29,7 @@
 		4DB4F6BC1422B31606221696 /* SettingsTabCell.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30BB3841DB84B592D3792E1C /* SettingsTabCell.swift */; };
 		546F00830189DD5609F0CB65 /* qobuz-catalog-search.json in Resources */ = {isa = PBXBuildFile; fileRef = 292AA40ABD09B392F6334F00 /* qobuz-catalog-search.json */; };
 		553420500570A777DCE5B31F /* QobuzDownloadManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = BE99D28EAB19B12548D468E3 /* QobuzDownloadManager.swift */; };
+		5A70224F4BD0EC6D862DE777 /* THIRD_PARTY_NOTICES.md in Resources */ = {isa = PBXBuildFile; fileRef = 79445F159B79821B10D1D267 /* THIRD_PARTY_NOTICES.md */; };
 		5BDC4A1F75F43A6C746444B0 /* QobuzStreamingClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C6D8EF7071824EC8960C984 /* QobuzStreamingClient.swift */; };
 		5CB5B6AB72DA1D63EF07F103 /* AlbumDetailTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FCD49F7259AA7430558F0D2E /* AlbumDetailTests.swift */; };
 		6389E6AEA676C960C6B6FD00 /* EQProfileEditorViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = EA6B6D58B8C7468B3DB454BE /* EQProfileEditorViewController.swift */; };
@@ -55,11 +55,11 @@
 		AB58117F7CEE6C7F4D6E72EA /* ScreenViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 45023AE14CFD1060EA3A3B1C /* ScreenViews.swift */; };
 		ACCFE90625931A7DCED30DD7 /* EQProfile.swift in Sources */ = {isa = PBXBuildFile; fileRef = 25ABF70CE93D3345ADA7D371 /* EQProfile.swift */; };
 		AD96DBFEAE1B38B536E5B9A3 /* DataLayerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E361B2C05BF20CB781922320 /* DataLayerTests.swift */; };
+		AEC77AC6CAE4D2AAE55EE8D0 /* QOBINE_GPL-3.0.txt in Resources */ = {isa = PBXBuildFile; fileRef = 7C1BC44D2A22EC9B84B07F4A /* QOBINE_GPL-3.0.txt */; };
 		B2F3C2B9C65C2F64D6F9521E /* DetailViewControllers.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0CC09EE9711007171E24EF4A /* DetailViewControllers.swift */; };
 		B5B58F7216461C983831ABBE /* AudioPathTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2B5ED4051ADB9494416A9335 /* AudioPathTests.swift */; };
 		B63F51404D7037724602E079 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = 832C0FB47FB9F3963FEE9B4F /* Models.swift */; };
 		BEC7E5F561F3B2E94B84CB07 /* QobuzPreferences.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D50C41731CB76FA0CACAC66 /* QobuzPreferences.swift */; };
-		C1078329660256A0C0106542 /* QOBINE_GPL-3.0.txt in Resources */ = {isa = PBXBuildFile; fileRef = C2FDC0FF5803C050FE4C9EAB /* QOBINE_GPL-3.0.txt */; };
 		C8764E517C32045DFE1D3A11 /* DemoTourUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0030B327356B782C0DD2EDAB /* DemoTourUITests.swift */; };
 		CFF1C2C9A3AD8713F34E4B6F /* QobuzCatalogViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = E4CE39949A60EF81A6C63138 /* QobuzCatalogViewController.swift */; };
 		D52C1DD62F42CD4BCB4B3D7B /* QobuzCatalogMapper.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4FBF7157397812E6BE130B0 /* QobuzCatalogMapper.swift */; };
@@ -93,7 +93,6 @@
 		0030B327356B782C0DD2EDAB /* DemoTourUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DemoTourUITests.swift; sourceTree = "<group>"; };
 		0128D1A17B2AF0ADBC70FDD5 /* EQDSP.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EQDSP.swift; sourceTree = "<group>"; };
 		03683C8219C07CF3D42E2B4C /* PlayerViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerViewController.swift; sourceTree = "<group>"; };
-		03D9C1476B14FA080E084F2E /* THIRD_PARTY_NOTICES.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = THIRD_PARTY_NOTICES.md; sourceTree = "<group>"; };
 		09235F4F798BC66054695B79 /* EQProfileCell.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EQProfileCell.swift; sourceTree = "<group>"; };
 		0A2CA2BC2C73DDEFF6ACD799 /* EQChainRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EQChainRuntime.swift; sourceTree = "<group>"; };
 		0CC09EE9711007171E24EF4A /* DetailViewControllers.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DetailViewControllers.swift; sourceTree = "<group>"; };
@@ -123,6 +122,8 @@
 		66FCA43AE092FE2427CA73DF /* DownloadTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownloadTests.swift; sourceTree = "<group>"; };
 		6CD2F59B7B373189A9248769 /* AudioPath.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioPath.swift; sourceTree = "<group>"; };
 		76D6CFC2642BD7F29AF36BB6 /* SettingsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsTests.swift; sourceTree = "<group>"; };
+		79445F159B79821B10D1D267 /* THIRD_PARTY_NOTICES.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = THIRD_PARTY_NOTICES.md; sourceTree = "<group>"; };
+		7C1BC44D2A22EC9B84B07F4A /* QOBINE_GPL-3.0.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = "QOBINE_GPL-3.0.txt"; sourceTree = "<group>"; };
 		7F02ACC2458ACF2ABB38E255 /* EQAudioTap.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EQAudioTap.swift; sourceTree = "<group>"; };
 		808058CF99E0B473FD2BC92D /* BundledEQProfiles.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BundledEQProfiles.swift; sourceTree = "<group>"; };
 		832C0FB47FB9F3963FEE9B4F /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
@@ -136,7 +137,6 @@
 		BC2B6E59F8224527034DF3BA /* OfflineMode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OfflineMode.swift; sourceTree = "<group>"; };
 		BE99D28EAB19B12548D468E3 /* QobuzDownloadManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QobuzDownloadManager.swift; sourceTree = "<group>"; };
 		BEF928CC750AC319827D47AE /* SongSwipeActionCell.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SongSwipeActionCell.swift; sourceTree = "<group>"; };
-		C2FDC0FF5803C050FE4C9EAB /* QOBINE_GPL-3.0.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = "QOBINE_GPL-3.0.txt"; sourceTree = "<group>"; };
 		C41D09EB89BCAD9FDA603A22 /* AlbumActionSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AlbumActionSheet.swift; sourceTree = "<group>"; };
 		C54C9C1D479227E0967901BF /* QueueRegressionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QueueRegressionTests.swift; sourceTree = "<group>"; };
 		C57CBA3CCE7ECF32B5A90B44 /* QobuzStreamTestViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QobuzStreamTestViewController.swift; sourceTree = "<group>"; };
@@ -205,16 +205,6 @@
 				292AA40ABD09B392F6334F00 /* qobuz-catalog-search.json */,
 			);
 			path = Fixtures;
-			sourceTree = "<group>";
-		};
-		52A82B1299ABFF84AA5FCA0F /* ipod-music-app-updated */ = {
-			isa = PBXGroup;
-			children = (
-				C2FDC0FF5803C050FE4C9EAB /* QOBINE_GPL-3.0.txt */,
-				03D9C1476B14FA080E084F2E /* THIRD_PARTY_NOTICES.md */,
-			);
-			name = "ipod-music-app-updated";
-			path = ../..;
 			sourceTree = "<group>";
 		};
 		62CF90E2F858567330FD55B8 /* Products */ = {
@@ -287,10 +277,20 @@
 			path = Components;
 			sourceTree = "<group>";
 		};
+		A0D0426B6F3C5DAF71DDDD80 /* remaster */ = {
+			isa = PBXGroup;
+			children = (
+				7C1BC44D2A22EC9B84B07F4A /* QOBINE_GPL-3.0.txt */,
+				79445F159B79821B10D1D267 /* THIRD_PARTY_NOTICES.md */,
+			);
+			name = remaster;
+			path = ../..;
+			sourceTree = "<group>";
+		};
 		E340EFC32A977D7F16C6A790 = {
 			isa = PBXGroup;
 			children = (
-				52A82B1299ABFF84AA5FCA0F /* ipod-music-app-updated */,
+				A0D0426B6F3C5DAF71DDDD80 /* remaster */,
 				6F88A62CBF13EA42792D7F66 /* Resources */,
 				FD5A89AA5010758D116BF04C /* Sources */,
 				06D8A569689EBE572B46F89A /* Tests */,
@@ -388,14 +388,14 @@
 				LastUpgradeCheck = 1430;
 				TargetAttributes = {
 					254808EE72BDC6707FDE4568 = {
-						DevelopmentTeam = L5C6Z6SQ2H;
+						DevelopmentTeam = "";
 						TestTargetID = D0DD6E6D3FA56D27E2570C4B;
 					};
 					4A5E2F394FD036977EF6A42C = {
-						DevelopmentTeam = L5C6Z6SQ2H;
+						DevelopmentTeam = "";
 					};
 					D0DD6E6D3FA56D27E2570C4B = {
-						DevelopmentTeam = L5C6Z6SQ2H;
+						DevelopmentTeam = "";
 					};
 				};
 			};
@@ -428,8 +428,8 @@
 				169FDE7709C76A110FBECA57 /* Assets.xcassets in Resources */,
 				FA62D610E3FA8F5737CA1A61 /* EQ in Resources */,
 				21D9C68E891CF1677645A814 /* LaunchScreen.storyboard in Resources */,
-				C1078329660256A0C0106542 /* QOBINE_GPL-3.0.txt in Resources */,
-				0D7D4986CE87C2C0171720D1 /* THIRD_PARTY_NOTICES.md in Resources */,
+				AEC77AC6CAE4D2AAE55EE8D0 /* QOBINE_GPL-3.0.txt in Resources */,
+				5A70224F4BD0EC6D862DE777 /* THIRD_PARTY_NOTICES.md in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -573,7 +573,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
-				DEVELOPMENT_TEAM = L5C6Z6SQ2H;
+				DEVELOPMENT_TEAM = "";
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				GCC_C_LANGUAGE_STANDARD = gnu11;
@@ -734,7 +734,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
 				DEBUG_INFORMATION_FORMAT = dwarf;
-				DEVELOPMENT_TEAM = L5C6Z6SQ2H;
+				DEVELOPMENT_TEAM = "";
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
 				GCC_C_LANGUAGE_STANDARD = gnu11;

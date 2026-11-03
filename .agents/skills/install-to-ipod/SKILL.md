@@ -24,11 +24,11 @@ Everything below was verified on 2026-10-27 against the real device.
 | | |
 | :--- | :--- |
 | Device | iPod touch 6th gen (`iPod7,1`), iOS 12.5.8 |
-| Legacy UDID | `40c00a8dca9cddd6eb34507d8d737927b99cd10e` |
-| CoreDevice id | `E06F06F3-3226-518E-9FBD-232732C4D055` (unusable on iOS 12) |
-| **Installed bundle id** | **`com.fletcher.MusicPrototype.L5C6Z6SQ2H`** — not the project's `com.fletcher.MusicPrototype` |
-| Team | `L5C6Z6SQ2H` |
-| Signing identity | `Apple Development: fletcherm2005@icloud.com (6F6UX9F67G)` |
+| Legacy UDID | `<device-udid>` — from `idevice_id -l` |
+| CoreDevice id | `<coredevice-udid>` — from `xcrun devicectl list devices` (unusable on iOS 12) |
+| **Installed bundle id** | **`com.fletcher.MusicPrototype.<TEAM_ID>`** — not the project's `com.fletcher.MusicPrototype` |
+| Team | `<TEAM_ID>` — your own Apple Developer team id |
+| Signing identity | `Apple Development: <you@example.com> (<CERT_ID>)` |
 | Toolchain | Xcode 26.x, SDK `iphoneos26.5`, deployment target 12.0 |
 
 Two consequences that drive the whole procedure:
@@ -37,7 +37,7 @@ Two consequences that drive the whole procedure:
     That blocks *launching*, not *installing*. Do not abandon the install because Xcode
     or `idevicedebug` complains about the DDI.
 2.  **The app on the device uses a suffixed bundle id** because it was first installed
-    through Splice, which registered `com.fletcher.MusicPrototype.L5C6Z6SQ2H` as an
+    through Splice, which registered `com.fletcher.MusicPrototype.<TEAM_ID>` as an
     explicit App ID. Installing the unsuffixed id creates a **second** app and orphans
     the existing Keychain credentials.
 
@@ -72,7 +72,7 @@ ideviceinstaller list | grep -i music
 
 *   Non-empty → use that exact id, so the new build replaces the app in place and keeps
     its Keychain entry, downloaded tracks and settings.
-*   Empty → the app is not installed yet. Use `com.fletcher.MusicPrototype.L5C6Z6SQ2H` to
+*   Empty → the app is not installed yet. Use `com.fletcher.MusicPrototype.<TEAM_ID>` to
     stay consistent with previous installs, or the project's own id for a clean first
     install.
 
@@ -89,9 +89,9 @@ xcodebuild \
   -destination 'generic/platform=iOS' \
   -derivedDataPath /tmp/Music-Device-Build \
   -allowProvisioningUpdates \
-  DEVELOPMENT_TEAM=L5C6Z6SQ2H \
+  DEVELOPMENT_TEAM=<TEAM_ID> \
   CODE_SIGN_STYLE=Automatic \
-  PRODUCT_BUNDLE_IDENTIFIER=com.fletcher.MusicPrototype.L5C6Z6SQ2H \
+  PRODUCT_BUNDLE_IDENTIFIER=com.fletcher.MusicPrototype.<TEAM_ID> \
   build
 ```
 
@@ -115,7 +115,7 @@ APP=/tmp/Music-Device-Build/Build/Products/Release-iphoneos/Music.app
 
 security cms -D -i "$APP/embedded.mobileprovision" > /tmp/prof.plist
 /usr/libexec/PlistBuddy -c "Print ProvisionedDevices" /tmp/prof.plist \
-  | grep -c 40c00a8dca9cddd6eb34507d8d737927b99cd10e     # must print 1
+  | grep -c <device-udid>     # must print 1
 /usr/libexec/PlistBuddy -c "Print ExpirationDate" /tmp/prof.plist
 ```
 
@@ -160,8 +160,8 @@ codesign -d --entitlements :- "$APP" | grep -A2 application-identifier
 The last command must show real values, not build variables:
 
 ```
-application-identifier : L5C6Z6SQ2H.com.fletcher.MusicPrototype.L5C6Z6SQ2H
-keychain-access-groups : L5C6Z6SQ2H.com.fletcher.MusicPrototype.L5C6Z6SQ2H
+application-identifier : <TEAM_ID>.com.fletcher.MusicPrototype.<TEAM_ID>
+keychain-access-groups : <TEAM_ID>.com.fletcher.MusicPrototype.<TEAM_ID>
 get-task-allow         : true
 ```
 
@@ -184,7 +184,7 @@ Check for a fresh crash from the new build:
 
 ```sh
 rm -rf /tmp/ipod-crashes && mkdir -p /tmp/ipod-crashes
-idevicecrashreport -u 40c00a8dca9cddd6eb34507d8d737927b99cd10e /tmp/ipod-crashes
+idevicecrashreport -u <device-udid> /tmp/ipod-crashes
 find /tmp/ipod-crashes -iname "Music*" -newermt "-10 minutes" | head
 ```
 
@@ -227,7 +227,7 @@ the Qobuz session.
 | `Could not start com.apple.debugserver!` | Same missing DDI | Do not try to launch programmatically; the user taps the icon |
 | `Install: Failed` with a device error code | Profile does not include the UDID, or entitlements mismatch | Re-check step 3 and confirm step 5 used the `.xcent` |
 | `idevice_id -l` prints nothing | Locked, unplugged, or untrusted | Unlock, reconnect, tap **Trust This Computer** |
-| Profile for the suffixed id cannot be created | The explicit App ID is missing from the portal | The Splice-registered id `com.fletcher.MusicPrototype.L5C6Z6SQ2H` should already exist; otherwise install under the project id instead |
+| Profile for the suffixed id cannot be created | The explicit App ID is missing from the portal | The Splice-registered id `com.fletcher.MusicPrototype.<TEAM_ID>` should already exist; otherwise install under the project id instead |
 
 ## Do not
 
