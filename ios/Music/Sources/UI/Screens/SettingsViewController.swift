@@ -176,6 +176,7 @@ final class SettingsViewController: UIViewController, UITableViewDataSource, UIT
         tabsTable.delegate = self
         tabsTable.rowHeight = 42
         tabsTable.isScrollEnabled = false
+        tabsTable.accessibilityIdentifier = "settings.tabs.table"
         tabsTable.backgroundColor = DesignSystem.pageBackground
         tabsTable.separatorColor = DesignSystem.separator
         tabsTable.layer.cornerRadius = 8

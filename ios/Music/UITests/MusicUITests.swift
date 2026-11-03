@@ -38,9 +38,11 @@ final class MusicUITests: XCTestCase {
         XCTAssertFalse(app.staticTexts["Import Music"].exists)
         XCTAssertTrue(app.segmentedControls["settings.appearance"].exists)
         XCTAssertTrue(app.segmentedControls["settings.qobuzQuality"].exists)
-        XCTAssertTrue(app.buttons["Account: Not signed in"].exists)
+        let account = app.buttons["settings.qobuzAccount"]
+        XCTAssertTrue(account.exists)
+        XCTAssertTrue(account.label.contains("Not signed in"))
 
-        let tabRows = settings.tables.cells
+        let tabRows = app.tables["settings.tabs.table"].cells
         XCTAssertEqual(tabRows.count, 5)
         for title in ["Discover", "Search", "Albums", "Artists", "Tracks"] {
             XCTAssertTrue(tabRows.containing(.staticText, identifier: title).firstMatch.exists)
