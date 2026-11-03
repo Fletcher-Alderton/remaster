@@ -2,6 +2,8 @@ import UIKit
 
 final class QueueViewController: UIViewController, UITableViewDataSource, UITableViewDelegate, UIGestureRecognizerDelegate {
     var onSelectTrack: ((Int) -> Void)?
+    var onRemoveTrack: ((Int) -> Void)?
+    var onMoveTrack: ((Int, Int) -> Void)?
     var onClearQueue: (() -> Void)?
     var onShuffleQueue: (() -> Void)?
     var onDismissSwipe: (() -> Void)?
@@ -10,6 +12,8 @@ final class QueueViewController: UIViewController, UITableViewDataSource, UITabl
 
     private let tableView = UITableView(frame: .zero, style: .plain)
     private var songSwipeCoordinator: SongListSwipeCoordinator?
+    private weak var songSwipePan: UIGestureRecognizer?
+    private weak var editButton: UIButton?
     private var tracks: [ScreenTrack]
     private var currentIndex: Int
     private var headerArtworkLoader: QueueArtworkLoader?
@@ -42,7 +46,11 @@ final class QueueViewController: UIViewController, UITableViewDataSource, UITabl
         tableView.sectionHeaderHeight = 0
         tableView.sectionFooterHeight = 0
         tableView.register(QueueTrackCell.self, forCellReuseIdentifier: QueueTrackCell.reuseIdentifier)
+        let existingGestures = tableView.gestureRecognizers ?? []
         songSwipeCoordinator = SongListSwipeCoordinator(tableView: tableView)
+        songSwipePan = tableView.gestureRecognizers?.first { gesture in
+            !existingGestures.contains(where: { $0 === gesture })
+        }
         tableView.tableHeaderView = makeHeader()
         view.addSubview(tableView)
         tableView.pinEdges(to: view)
@@ -157,6 +165,15 @@ final class QueueViewController: UIViewController, UITableViewDataSource, UITabl
         clear.titleLabel?.font = DesignSystem.font(15, weight: .medium)
         clear.addTarget(self, action: #selector(clearTapped), for: .touchUpInside)
         clear.isHidden = numberOfUpcomingTracks == 0
+        let edit = UIButton(type: .system)
+        edit.translatesAutoresizingMaskIntoConstraints = false
+        edit.setTitle(tableView.isEditing ? "Done" : "Edit", for: .normal)
+        edit.setTitleColor(DesignSystem.accent, for: .normal)
+        edit.titleLabel?.font = DesignSystem.font(15, weight: .medium)
+        edit.accessibilityIdentifier = "queue.edit"
+        edit.accessibilityLabel = tableView.isEditing ? "Done editing queue" : "Edit queue"
+        edit.addTarget(self, action: #selector(editTapped), for: .touchUpInside)
+        editButton = edit
         header.addSubview(title)
         header.addSubview(shuffle)
         header.addSubview(repeatButton)
@@ -166,6 +183,7 @@ final class QueueViewController: UIViewController, UITableViewDataSource, UITabl
         header.addSubview(separator)
         header.addSubview(upNextTitle)
         header.addSubview(clear)
+        header.addSubview(edit)
         NSLayoutConstraint.activate([
             title.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 14),
             title.topAnchor.constraint(equalTo: header.topAnchor, constant: 14),
@@ -194,8 +212,13 @@ final class QueueViewController: UIViewController, UITableViewDataSource, UITabl
             separator.heightAnchor.constraint(equalToConstant: 0.5),
             upNextTitle.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 14),
             upNextTitle.bottomAnchor.constraint(equalTo: header.bottomAnchor, constant: -10),
-            clear.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -14),
-            clear.centerYAnchor.constraint(equalTo: upNextTitle.centerYAnchor)
+            upNextTitle.trailingAnchor.constraint(lessThanOrEqualTo: clear.leadingAnchor, constant: -8),
+            clear.trailingAnchor.constraint(equalTo: edit.leadingAnchor, constant: -12),
+            clear.centerYAnchor.constraint(equalTo: upNextTitle.centerYAnchor),
+            edit.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -14),
+            edit.centerYAnchor.constraint(equalTo: upNextTitle.centerYAnchor),
+            edit.widthAnchor.constraint(greaterThanOrEqualToConstant: 44),
+            edit.heightAnchor.constraint(equalToConstant: 44)
         ])
         InteractionMotion.install(in: header)
         return header
@@ -237,6 +260,33 @@ final class QueueViewController: UIViewController, UITableViewDataSource, UITabl
         (cell as? QueueTrackCell)?.cancelArtwork()
     }
 
+    func tableView(_ tableView: UITableView, canEditRowAt indexPath: IndexPath) -> Bool {
+        return onRemoveTrack != nil
+    }
+
+    func tableView(_ tableView: UITableView, commit editingStyle: UITableViewCell.EditingStyle, forRowAt indexPath: IndexPath) {
+        guard editingStyle == .delete else { return }
+        onRemoveTrack?(currentIndex + 1 + indexPath.row)
+    }
+
+    func tableView(_ tableView: UITableView, canMoveRowAt indexPath: IndexPath) -> Bool {
+        return onMoveTrack != nil
+    }
+
+    func tableView(_ tableView: UITableView, moveRowAt sourceIndexPath: IndexPath, to destinationIndexPath: IndexPath) {
+        onMoveTrack?(currentIndex + 1 + sourceIndexPath.row, currentIndex + 1 + destinationIndexPath.row)
+    }
+
+    func setQueueEditing(_ editing: Bool) {
+        loadViewIfNeeded()
+        // The coordinator installs one pan but exposes no enable/disable API.
+        // Disable its recognizer, not the table's scrolling/reordering gestures.
+        songSwipePan?.isEnabled = !editing
+        tableView.setEditing(editing, animated: true)
+        editButton?.setTitle(editing ? "Done" : "Edit", for: .normal)
+        editButton?.accessibilityLabel = editing ? "Done editing queue" : "Edit queue"
+    }
+
     func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
         tableView.deselectRow(at: indexPath, animated: true)
         onSelectTrack?(currentIndex + 1 + indexPath.row)
@@ -250,6 +300,7 @@ final class QueueViewController: UIViewController, UITableViewDataSource, UITabl
         if let cell = tableView.cellForRow(at: indexPath) { InteractionMotion.setRow(cell, highlighted: false) }
     }
 
+    @objc private func editTapped() { setQueueEditing(!tableView.isEditing) }
     @objc private func clearTapped() { onClearQueue?() }
     @objc private func shuffleTapped() { onShuffleQueue?() }
     @objc private func currentTrackLongPressed(_ recognizer: UILongPressGestureRecognizer) {

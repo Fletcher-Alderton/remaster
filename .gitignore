@@ -1,7 +1,33 @@
-node_modules/
-dist/
+# macOS
 .DS_Store
+
+# Xcode / build output
+build/
 DerivedData/
 ios/Music/build/
 *.xcuserstate
 xcuserdata/
+*.xcresult
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Node (docs tooling)
+node_modules/
+dist/
+
+# Local tooling state
+.codegraph/*
+!.codegraph/.gitignore
+.amp/
+
+# Vendored upstream reference clone (see QOBUZ_API_CHEATSHEET.md)
+qobine/
+
+# Demo capture scratch space
+media/raw/
+
+# Optional credentials used only in personal device builds.
+QobuzPersonalCredentials.json

@@ -2,7 +2,12 @@ import UIKit
 
 final class RootViewController: UIViewController {
     private let appState = AppState()
+    private var downloadManager: QobuzDownloadManager?
+    private var downloadInitializationError: String?
+    private var qobuzDownloadTracksByAlbumID: [String: [QobuzSearchTrack]] = [:]
     private let playbackBackend: PlaybackControlling?
+    private var accountGeneration = UUID()
+    private var playbackCredentials: QobuzCredentials?
     private var playbackBackendOverride: PlaybackControlling?
     private var qobuzPresentationTracks: [String: ScreenTrack] = [:]
     private var qobuzCatalogAlbumIDByTrackID: [String: String] = [:]
@@ -18,12 +23,20 @@ final class RootViewController: UIViewController {
 
     init(
         playbackBackend: PlaybackControlling? = nil,
-        presentationTrackProvider: ((String) -> ScreenTrack?)? = nil
+        presentationTrackProvider: ((String) -> ScreenTrack?)? = nil,
+        offlineMode: OfflineMode = .shared
     ) {
         self.playbackBackend = playbackBackend
         self.injectedPresentationTrackProvider = presentationTrackProvider
+        self.offlineMode = offlineMode
         super.init(nibName: nil, bundle: nil)
     }
+
+    private let offlineMode: OfflineMode
+    /// Album page currently on screen, with the full (unfiltered) album behind it.
+    private weak var visibleAlbumController: AlbumDetailViewController?
+    private var visibleFullAlbum: ScreenAlbum?
+    private var visibleAlbumIsOfflineOnly = false
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
@@ -36,6 +49,7 @@ final class RootViewController: UIViewController {
     private var activeController: UIViewController?
     private var tabControllers: [LibraryTab: UIViewController] = [:]
     private weak var playerController: PlayerViewController?
+    private var playerQueueSnapshot: QueueState?
     private weak var queueController: QueueViewController?
 
     private var renderedQueueTrackIDs: [String] = []
@@ -70,6 +84,12 @@ final class RootViewController: UIViewController {
             selector: #selector(releaseInactiveTabControllers),
             name: UIApplication.didReceiveMemoryWarningNotification,
             object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(offlineModeChanged),
+            name: OfflineMode.didChange,
+            object: offlineMode
         )
         InteractionMotion.install(in: view)
         refreshTabStrip()
@@ -107,22 +127,29 @@ final class RootViewController: UIViewController {
     }
 
     private func configureData() {
-        configurePlaybackState()
+        do { downloadManager = try QobuzDownloadManager() }
+        catch { downloadInitializationError = "Download library unavailable. Existing files have not been removed." }
+        if playbackBackend == nil, let credentials = QobuzCredentialStore.shared.load() {
+            let saved = appState.queueState
+            activateQobuzPlaybackBackend(credentials: credentials, restoring: saved)
+        } else {
+            configurePlaybackState()
+        }
     }
 
     private func configurePlaybackState() {
         guard let controller = playback else {
-            appState.updateQueueState(QueueState())
             updatePlaybackViews(queue: QueueState())
             return
         }
-        if playbackBackendOverride == nil {
-            controller.clearQueue()
-        }
         appState.updateQueueState(controller.queueState)
-        controller.onStateChange = { [weak self] queue in
-            let update = { [weak self] in
-                guard let self = self else { return }
+        controller.onStateChange = { [weak self, weak controller] queue in
+            let update = { [weak self, weak controller] in
+                guard let self = self, let controller = controller, self.playback === controller else {
+                    NSLog("NPDIAG onStateChange dropped idx=%d self=%@ controllerMatches=%@", queue.currentIndex,
+                          self == nil ? "nil" : "ok", (self?.playback === controller) ? "yes" : "no")
+                    return
+                }
                 self.appState.updateQueueState(queue)
                 self.updatePlaybackViews(queue: queue)
             }
@@ -154,11 +181,12 @@ final class RootViewController: UIViewController {
                     return
                 }
                 let format = "\(stream.bitDepth)-bit / \(Int(stream.samplingRate * 1000)) Hz"
+                let source = stream.url.isFileURL ? "downloaded audio" : "returned stream"
                 let status: String
                 if let actualQuality = actualQuality, actualQuality != requestedQuality {
-                    status = "Requested \(requestedQuality.title); Qobuz provided \(actualQuality.title). Playing returned stream (\(format))."
+                    status = "Requested \(requestedQuality.title); Qobuz provided \(actualQuality.title). Playing \(source) (\(format))."
                 } else if let actualQuality = actualQuality {
-                    status = "Playing \(actualQuality.title) (\(format))."
+                    status = "Playing \(stream.url.isFileURL ? "downloaded " : "")\(actualQuality.title) (\(format))."
                 } else {
                     status = "Playing Qobuz stream (\(format))."
                 }
@@ -288,6 +316,8 @@ final class RootViewController: UIViewController {
     @objc private func releaseInactiveTabControllers() {
         let active = activeController
         tabControllers = tabControllers.filter { $0.value === active }
+        // Cached screen text stays on disk; only the in-memory copy is dropped.
+        QobuzCatalogResponseCache.shared.trimMemory()
     }
 
     private func replaceActiveController(
@@ -354,7 +384,12 @@ final class RootViewController: UIViewController {
             case .artists: mode = .artists
             default: mode = .tracks
             }
-            let catalog = QobuzCatalogViewController(mode: mode, client: QobuzStreamingClient(credentials: credentials))
+            let catalog = QobuzCatalogViewController(
+                mode: mode,
+                client: QobuzStreamingClient(credentials: credentials, catalogCache: .shared),
+                offlineMode: offlineMode,
+                offlineLibrary: { [weak self] in self?.offlineLibrary() ?? .empty }
+            )
             configureCatalogActions(catalog, credentials: credentials)
             return catalog
         case .settings:
@@ -488,6 +523,10 @@ final class RootViewController: UIViewController {
             self?.showAlbumQueueMenu(for: album)
         }
         controller.onTrackSelected = { [weak self] track in self?.start(track: track) }
+        controller.onPlayTracks = { [weak self] tracks in
+            guard let self = self, !tracks.isEmpty else { return }
+            self.playQobuz(tracks: tracks, startingAt: 0, quality: QobuzPreferences.quality)
+        }
         controller.onTrackNavigationRequested = { [weak self] track in self?.showTrackNavigationMenu(for: track) }
         controller.onSongSwipeAction = { [weak self] track, action in self?.handleSongSwipe(action, track: track) }
         InteractionMotion.present(controller, from: presentingController ?? self)
@@ -540,7 +579,11 @@ final class RootViewController: UIViewController {
     }
 
     private func queueAlbumTracks(_ tracks: [ScreenTrack], action: AlbumQueueAction, hostView: UIView?) {
-        guard !tracks.isEmpty else { return }
+        let tracks = offlineMode.restrictsToDownloads ? tracks.filter(isDownloaded) : tracks
+        guard !tracks.isEmpty else {
+            if offlineMode.restrictsToDownloads { showNothingDownloaded() }
+            return
+        }
         tracks.forEach(rememberQobuz)
         guard ensureQobuzPlaybackBackend(), let playback = playback else { return }
         let wasEmpty = playback.queueState.currentTrackID == nil
@@ -595,7 +638,8 @@ final class RootViewController: UIViewController {
             InteractionMotion.dismiss(presented) { [weak self] in self?.openPlayer() }
             return
         }
-        let controller = PlayerViewController(state: state)
+        let controller = PlayerViewController(state: state, occurrenceID: String(queueState.currentIndex))
+        playerQueueSnapshot = queueState
         playerController = controller
         controller.onTogglePlayback = { [weak self] in self?.playback?.togglePlayPause() }
         controller.onLike = { [weak self] in
@@ -632,13 +676,23 @@ final class RootViewController: UIViewController {
         renderedQueueCurrentIndex = queue.currentIndex
         renderedQueuePresentationRevision = qobuzPresentationRevision
         controller.onSelectTrack = { [weak self, weak controller] index in
+            NSLog("NPDIAG queue select index=%d current=%d", index, self?.playback?.queueState.currentIndex ?? -1)
             guard let self = self, let controller = controller, let playback = self.playback else { return }
-            let wasPlaying = playback.queueState.isPlaying
-            playback.setQueue(trackIDs: playback.queueState.trackIDs, startingAt: index)
-            if wasPlaying { playback.play() }
+            if let backend = playback as? QobuzPlaybackController {
+                backend.selectTrack(at: index)
+            } else {
+                let wasPlaying = playback.queueState.isPlaying
+                playback.setQueue(trackIDs: playback.queueState.trackIDs, startingAt: index)
+                if wasPlaying { playback.play() }
+            }
             InteractionMotion.dismiss(controller)
         }
+        if let backend = playback as? QobuzPlaybackController {
+            controller.onRemoveTrack = { [weak backend] index in backend?.removeTrack(at: index) }
+            controller.onMoveTrack = { [weak backend] source, destination in backend?.moveTrack(from: source, to: destination) }
+        }
         controller.onClearQueue = { [weak self, weak controller] in
+            if let backend = self?.playback as? QobuzPlaybackController { backend.clearUpcoming(); return }
             guard let self = self,
                   let controller = controller,
                   let playback = self.playback,
@@ -650,6 +704,7 @@ final class RootViewController: UIViewController {
             controller.update(tracks: [currentTrack], currentIndex: 0)
         }
         controller.onShuffleQueue = { [weak self, weak controller] in
+            if let backend = self?.playback as? QobuzPlaybackController { backend.shuffleUpcoming(); return }
             guard let self = self, let controller = controller, let playback = self.playback else { return }
             let queue = playback.queueState
             guard let current = queue.currentTrackID else { return }
@@ -747,6 +802,7 @@ final class RootViewController: UIViewController {
     private func updatePlaybackViews(queue: QueueState) {
         updateQueueViewIfNeeded(queue: queue)
         guard let state = currentPlayerState() else {
+            NSLog("NPDIAG updatePlaybackViews no state idx=%d id=%@ live=%@", queue.currentIndex, queue.currentTrackID ?? "nil", queueState.currentTrackID ?? "nil")
             miniPlayer.isHidden = true
             miniPlayer.artworkImageView.image = nil
             return
@@ -760,7 +816,20 @@ final class RootViewController: UIViewController {
             progress: progress
         )
         miniPlayer.isHidden = isDisplayingSettings || appState.currentTab == .settings
-        playerController?.update(state: state)
+        var direction: PlayerViewController.SongChangeDirection?
+        if let previous = playerQueueSnapshot, previous.trackIDs == queue.trackIDs,
+           previous.currentIndex != queue.currentIndex {
+            direction = queue.currentIndex > previous.currentIndex ? .next : .previous
+        }
+        let diagChanged = playerQueueSnapshot?.currentIndex != queue.currentIndex || playerQueueSnapshot?.currentTrackID != queue.currentTrackID
+        playerQueueSnapshot = queue
+        if diagChanged {
+            NSLog("NPDIAG updatePlaybackViews idx=%d id=%@ live=%@ title=%@ player=%@ window=%@ presented=%@",
+                  queue.currentIndex, queue.currentTrackID ?? "nil", queueState.currentTrackID ?? "nil", state.track.title,
+                  playerController == nil ? "nil" : "set", playerController?.viewIfLoaded?.window == nil ? "nil" : "yes",
+                  String(describing: presentedViewController.map { type(of: $0) }))
+        }
+        playerController?.update(state: state, occurrenceID: String(queue.currentIndex), direction: direction)
     }
 
     private func updateQueueViewIfNeeded(queue: QueueState) {
@@ -822,11 +891,13 @@ final class RootViewController: UIViewController {
         switch action {
         case .enqueue:
             guard qobuzPresentationTracks[track.id] != nil else { return }
+            if offlineMode.restrictsToDownloads && !isDownloaded(track) { showNothingDownloaded(); return }
             guard ensureQobuzPlaybackBackend(), let playback = playback else { return }
             playback.enqueue(trackID: track.id)
             message = "Added to Queue"
         case .playNext:
             guard qobuzPresentationTracks[track.id] != nil else { return }
+            if offlineMode.restrictsToDownloads && !isDownloaded(track) { showNothingDownloaded(); return }
             guard ensureQobuzPlaybackBackend(), let playback = playback else { return }
             playback.playNext(trackID: track.id)
             message = "Playing Next"
@@ -851,22 +922,82 @@ final class RootViewController: UIViewController {
 
     private func playQobuz(tracks: [ScreenTrack], startingAt index: Int, quality: QobuzStreamQuality) {
         guard !tracks.isEmpty,
-              let credentials = QobuzCredentialStore.shared.load() else {
+              QobuzCredentialStore.shared.load() != nil else {
             let alert = UIAlertController(title: "Qobuz Sign-In Required", message: "Sign in to your Qobuz account before playing music.", preferredStyle: .alert)
             alert.addAction(UIAlertAction(title: "OK", style: .default))
             topPresentedController().present(alert, animated: true)
             return
         }
         tracks.forEach(rememberQobuz)
-        activateQobuzPlaybackBackend(credentials: credentials)
-        guard let playback = playback else { return }
+        var tracks = tracks
+        var index = index
+        if offlineMode.restrictsToDownloads {
+            let downloaded = OfflineMode.downloadedQueue(tracks, startingAt: index, isDownloaded: isDownloaded)
+            guard !downloaded.tracks.isEmpty else { showNothingDownloaded(); return }
+            (tracks, index) = downloaded
+        }
+        guard ensureQobuzPlaybackBackend(), let playback = playback else { return }
         playback.setQueue(trackIDs: tracks.map(\.id), startingAt: index)
         playback.play()
         openPlayer()
     }
 
+    // MARK: - Offline
+
+    /// Downloads for this account at the selected stream quality (the only files that can play offline).
+    private func offlineLibrary() -> OfflineLibrary {
+        OfflineLibrary(records: downloadManager?.records(quality: QobuzPreferences.quality) ?? [])
+    }
+
+    private func isDownloaded(_ track: ScreenTrack) -> Bool {
+        guard let id = Int64(track.id) else { return false }
+        return downloadManager?.record(trackID: id, quality: QobuzPreferences.quality) != nil
+    }
+
+    private func showNothingDownloaded() {
+        let alert = UIAlertController(
+            title: "Not Downloaded",
+            message: "You're offline, so only downloaded music can play. Reconnect, or pull down twice in Albums, Artists or Tracks to show everything.",
+            preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: "OK", style: .default))
+        topPresentedController().present(alert, animated: true)
+    }
+
+    /// While offline an album page lists only its downloaded tracks.
+    private func offlineVisible(_ album: ScreenAlbum) -> ScreenAlbum {
+        guard offlineMode.restrictsToDownloads else { return album }
+        let tracks = album.tracks.filter(isDownloaded)
+        return ScreenAlbum(id: album.id, title: album.title, artist: album.artist, year: album.year, genre: album.genre,
+                           quality: album.quality, artwork: album.artwork, artworkURL: album.artworkURL, tracks: tracks,
+                           releaseType: album.releaseType)
+    }
+
+    /// Keep an open album page in step with the connection: downloads only while offline,
+    /// the full album again (fetched if it was built from downloads) once reconnected.
+    @objc private func offlineModeChanged() {
+        guard let controller = visibleAlbumController, let full = visibleFullAlbum else { return }
+        if offlineMode.restrictsToDownloads || !visibleAlbumIsOfflineOnly {
+            controller.album = offlineVisible(full)
+            return
+        }
+        guard let credentials = QobuzCredentialStore.shared.load() else { return }
+        fetchQobuzAlbum(full, credentials: credentials, onFailure: { _ in }) { [weak self, weak controller] resolved in
+            guard let self = self, let controller = controller, controller.album.id == resolved.id else { return }
+            self.visibleFullAlbum = resolved
+            self.visibleAlbumIsOfflineOnly = false
+            controller.album = self.offlineVisible(resolved)
+            controller.configureDownloads(manager: self.downloadManager, tracks: self.qobuzDownloadTracksByAlbumID[resolved.id] ?? [],
+                                          quality: QobuzPreferences.quality, error: self.downloadInitializationError)
+        }
+    }
+
     private func ensureQobuzPlaybackBackend() -> Bool {
-        if playbackBackendOverride is QobuzPlaybackController { return true }
+        if playbackBackend != nil && playbackBackendOverride == nil { return true }
+        if playbackBackendOverride is QobuzPlaybackController,
+           let current = QobuzCredentialStore.shared.load(),
+           playbackCredentials?.userID == current.userID,
+           playbackCredentials?.userAuthToken == current.userAuthToken { return true }
         guard let credentials = QobuzCredentialStore.shared.load() else {
             showCatalogError(QobuzStreamingError.notAuthenticated)
             return false
@@ -875,14 +1006,56 @@ final class RootViewController: UIViewController {
         return true
     }
 
-    private func activateQobuzPlaybackBackend(credentials: QobuzCredentials) {
+    private func activateQobuzPlaybackBackend(credentials: QobuzCredentials, restoring saved: QueueState? = nil) {
+        playbackCredentials = credentials
+        let client = QobuzStreamingClient(credentials: credentials)
+        downloadManager?.setAccount(id: credentials.userID, resolver: client)
+        if let saved = saved {
+            for id in Set(saved.trackIDs) {
+                guard let trackID = Int64(id),
+                      let record = downloadManager?.record(trackID: trackID, quality: QobuzPreferences.quality) else { continue }
+                rememberQobuz(ScreenTrack(id: id, title: record.title,
+                    artist: record.artist ?? "Unknown Artist", album: record.albumTitle ?? "Unknown Album",
+                    quality: "Downloaded · \(QobuzStreamQuality(rawValue: record.actualFormatID)?.title ?? "Audio") · \(record.bitDepth)-bit / \(Int(record.samplingRate * 1000)) Hz",
+                    catalogAlbumID: record.albumID, duration: TimeInterval(record.duration ?? 0)))
+            }
+        }
         let provider: (String) -> ScreenTrack? = { [weak self] id in self?.qobuzPresentationTracks[id] }
         let backend = QobuzPlaybackController(
-            client: QobuzStreamingClient(credentials: credentials),
+            client: client,
             quality: { QobuzPreferences.quality },
-            trackProvider: provider
+            trackProvider: provider,
+            offlineStream: { [weak self] trackID, quality in
+                guard let manager = self?.downloadManager,
+                      let record = manager.record(trackID: trackID, quality: quality),
+                      let url = manager.fileURL(trackID: trackID, quality: quality) else { return nil }
+                return QobuzTrackURL(url: url, formatID: record.actualFormatID, mimeType: record.mimeType,
+                    samplingRate: record.samplingRate, bitDepth: record.bitDepth)
+            }
         )
+        if let saved = saved { backend.restoreQueue(saved) }
         activatePlaybackBackend(backend, presentationTrackProvider: provider)
+        if let saved = saved {
+            let generation = accountGeneration
+            let client = QobuzStreamingClient(credentials: credentials, catalogCache: .shared)
+            for id in Set(saved.trackIDs) {
+                client.track(id: id) { [weak self, weak backend] result in
+                    DispatchQueue.main.async {
+                        guard let self = self, let backend = backend,
+                              self.accountGeneration == generation,
+                              self.playback === backend,
+                              self.isCurrentAccount(credentials) else { return }
+                        if case .success(let track) = result { self.rememberQobuz(QobuzCatalogMapper.track(track)) }
+                        self.updatePlaybackViews(queue: self.queueState)
+                    }
+                }
+            }
+        }
+    }
+
+    private func isCurrentAccount(_ credentials: QobuzCredentials) -> Bool {
+        guard let current = QobuzCredentialStore.shared.load() else { return false }
+        return current.userID == credentials.userID && current.userAuthToken == credentials.userAuthToken
     }
 
     private func registerQobuzTrack(_ track: ScreenTrack) {
@@ -935,7 +1108,15 @@ final class RootViewController: UIViewController {
             presentQobuzAlbum(album, from: presentingController)
             return
         }
-        fetchQobuzAlbum(album, credentials: credentials) { [weak self] resolvedAlbum in
+        fetchQobuzAlbum(album, credentials: credentials, onFailure: { [weak self] error in
+            guard let self = self else { return }
+            // No connection and no cached copy: open the album from its downloads instead.
+            if !self.offlineMode.isOnline, let offline = self.offlineLibrary().album(id: album.id) {
+                self.presentQobuzAlbum(offline, from: presentingController, offlineOnly: true)
+            } else {
+                self.showCatalogError(error)
+            }
+        }) { [weak self] resolvedAlbum in
             self?.presentQobuzAlbum(resolvedAlbum, from: presentingController)
         }
     }
@@ -945,15 +1126,16 @@ final class RootViewController: UIViewController {
     private func fetchQobuzAlbum(
         _ album: ScreenAlbum,
         credentials: QobuzCredentials,
+        onFailure: ((Error) -> Void)? = nil,
         completion: @escaping (ScreenAlbum) -> Void
     ) {
-        let client = QobuzStreamingClient(credentials: credentials)
+        let client = QobuzStreamingClient(credentials: credentials, catalogCache: .shared)
         client.album(id: album.id) { [weak self] result in
             DispatchQueue.main.async {
-                guard let self = self else { return }
+                guard let self = self, self.isCurrentAccount(credentials) else { return }
                 switch result {
                 case .failure(let error):
-                    self.showCatalogError(error)
+                    if let onFailure = onFailure { onFailure(error) } else { self.showCatalogError(error) }
                 case .success(let detail):
                     // This association exists even when the album has no tracks.
                     // Never infer the album artist from the first track performer.
@@ -962,6 +1144,29 @@ final class RootViewController: UIViewController {
                         self.qobuzCatalogArtistIDByName[primaryArtist.name.lowercased()] = primaryArtist.id
                     } else {
                         self.qobuzPrimaryArtistByAlbumID.removeValue(forKey: detail.id)
+                    }
+                    do {
+                        let tracks = detail.tracks?.items ?? []
+                        guard detail.tracks?.hasMore != true,
+                              detail.tracks?.total.map({ $0 == tracks.count }) ?? true else {
+                            throw QobuzStreamingError.api("The full album track list was not returned.")
+                        }
+                        self.qobuzDownloadTracksByAlbumID[detail.id] = try tracks.map { track in
+                            // Preserve the resolved track and its rights; enrich only missing album metadata.
+                            let data = try JSONEncoder().encode(track)
+                            var object = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+                            if track.album == nil {
+                                var albumMetadata: [String: Any] = ["id": detail.id, "title": detail.title]
+                                if let artist = detail.artist { albumMetadata["artist"] = ["id": artist.id, "name": artist.name] }
+                                // Downloads keep the cover URL so offline albums still show artwork.
+                                if let cover = detail.artworkURL { albumMetadata["image"] = ["large": cover.absoluteString] }
+                                object["album"] = albumMetadata
+                            }
+                            if track.albumID == nil { object["album_id"] = detail.id }
+                            return try JSONDecoder().decode(QobuzSearchTrack.self, from: JSONSerialization.data(withJSONObject: object))
+                        }
+                    } catch {
+                        self.qobuzDownloadTracksByAlbumID.removeValue(forKey: detail.id)
                     }
                     let mapped = QobuzCatalogMapper.album(detail)
                     let artwork = detail.artworkURL.flatMap { ArtworkImagePipeline.shared.cachedImage(for: $0.absoluteString) }
@@ -997,18 +1202,61 @@ final class RootViewController: UIViewController {
         }
     }
 
-    private func presentQobuzAlbum(_ album: ScreenAlbum, from presentingController: UIViewController? = nil) {
+    private func presentQobuzAlbum(_ album: ScreenAlbum, from presentingController: UIViewController? = nil, offlineOnly: Bool = false) {
         rememberQobuz(album: album)
-        let controller = AlbumDetailViewController(album: album)
+        let controller = AlbumDetailViewController(album: offlineVisible(album))
+        visibleAlbumController = controller
+        visibleFullAlbum = album
+        visibleAlbumIsOfflineOnly = offlineOnly
+        let downloadTracks = qobuzDownloadTracksByAlbumID[album.id] ?? (offlineOnly ? offlineLibrary().searchTracks(albumID: album.id) : [])
+        controller.configureDownloads(manager: downloadManager,
+            tracks: downloadTracks, quality: QobuzPreferences.quality,
+            error: downloadInitializationError)
         controller.modalPresentationStyle = .fullScreen
         controller.onDismissSwipe = { [weak controller] in
             guard let controller = controller else { return }
             InteractionMotion.dismiss(controller)
         }
+        if let credentials = QobuzCredentialStore.shared.load() {
+            let generation = accountGeneration
+            let client = QobuzStreamingClient(credentials: credentials, catalogCache: .shared)
+            controller.configureLibrary(isSaved: nil)
+            client.library { [weak self, weak controller] result in
+                DispatchQueue.main.async {
+                    guard let self = self, self.accountGeneration == generation,
+                          self.isCurrentAccount(credentials) else { return }
+                    switch result {
+                    case .success(let library):
+                        controller?.configureLibrary(isSaved: library.albums?.items.contains { $0.id == album.id } ?? false)
+                        controller?.configureSavedTracks(Set((library.tracks?.items ?? []).map { String($0.id) }))
+                    case .failure(let error): controller?.configureLibrary(isSaved: nil, error: error.localizedDescription)
+                    }
+                }
+            }
+            controller.onLibraryChangeRequested = { [weak self] id, saved, completion in
+                guard let self = self, self.accountGeneration == generation, self.isCurrentAccount(credentials) else {
+                    completion(.failure(QobuzStreamingError.notAuthenticated)); return
+                }
+                client.setAlbumFavorite(id: id, isSaved: saved) { [weak self] result in
+                    DispatchQueue.main.async {
+                        guard let self = self, self.accountGeneration == generation, self.isCurrentAccount(credentials) else {
+                            completion(.failure(QobuzStreamingError.notAuthenticated)); return
+                        }
+                        if case .success = result {
+                            self.tabControllers.removeValue(forKey: .albums)
+                            if self.appState.currentTab == .albums { self.open(tab: .albums, direction: nil) }
+                        }
+                        completion(result)
+                    }
+                }
+            }
+        }
         controller.onTrackSelected = { [weak self] track in self?.start(track: track) }
         controller.onTrackNavigationRequested = { [weak self] track in self?.showTrackNavigationMenu(for: track) }
         controller.onSongSwipeAction = { [weak self] track, action in self?.handleSongSwipe(action, track: track) }
-        controller.onAlbumQueueRequested = { [weak self] selectedAlbum in self?.showAlbumQueueMenu(for: selectedAlbum) }
+        controller.onQueueAction = { [weak self, weak controller] selectedAlbum, action in
+            self?.queue(album: selectedAlbum, action: action, hostView: controller?.view)
+        }
         controller.onArtistSelected = { [weak self, weak controller] _ in
             guard let self = self,
                   let primaryArtist = self.qobuzPrimaryArtistByAlbumID[album.id],
@@ -1040,16 +1288,26 @@ final class RootViewController: UIViewController {
     }
 
     private func showQobuzArtist(_ artist: ScreenProfile, credentials: QobuzCredentials, from presentingController: UIViewController? = nil) {
+        if offlineMode.restrictsToDownloads {
+            showProfile(offlineLibrary().profile(artistID: artist.id, name: artist.name), from: presentingController)
+            return
+        }
         guard !artist.id.isEmpty else {
             showCatalogError(QobuzStreamingError.invalidResponse)
             return
         }
-        let client = QobuzStreamingClient(credentials: credentials)
+        let client = QobuzStreamingClient(credentials: credentials, catalogCache: .shared)
         client.artist(id: artist.id) { [weak self] result in
             DispatchQueue.main.async {
-                guard let self = self else { return }
+                guard let self = self, self.isCurrentAccount(credentials) else { return }
                 switch result {
-                case .failure(let error): self.showCatalogError(error)
+                case .failure(let error):
+                    let offline = self.offlineLibrary().profile(artistID: artist.id, name: artist.name)
+                    if !self.offlineMode.isOnline, !offline.tracks.isEmpty {
+                        self.showProfile(offline, from: presentingController)
+                    } else {
+                        self.showCatalogError(error)
+                    }
                 case .success(let detail):
                     let profile = QobuzCatalogMapper.profile(detail)
                     self.qobuzCatalogArtistIDByName[profile.name.lowercased()] = profile.id
@@ -1066,24 +1324,32 @@ final class RootViewController: UIViewController {
         topPresentedController().present(alert, animated: true)
     }
 
+    private func resetAccountPlayback() {
+        accountGeneration = UUID()
+        downloadManager?.setAccount(id: nil, resolver: nil)
+        qobuzDownloadTracksByAlbumID.removeAll()
+        playback?.clearQueue()
+        playback?.onStateChange = nil
+        playbackBackendOverride = nil
+        playbackCredentials = nil
+        appState.updateQueueState(QueueState())
+        qobuzPresentationTracks.removeAll()
+        qobuzCatalogAlbumIDByTrackID.removeAll()
+        qobuzCatalogAlbumIDs.removeAll()
+        qobuzAlbumTracksByID.removeAll()
+        qobuzCatalogArtistIDByName.removeAll()
+        qobuzPrimaryArtistByAlbumID.removeAll()
+        qobuzPresentationRevision += 1
+        resetCurrentArtwork()
+        updatePlaybackViews(queue: QueueState())
+    }
+
     private func handleQobuzAccountAction() {
         guard QobuzCredentialStore.shared.load() != nil else {
             showQobuzStreamTest(autoStartSignIn: true)
             return
         }
-        let alert = UIAlertController(title: "Qobuz Account", message: "Sign out of Qobuz on this device?", preferredStyle: .actionSheet)
-        alert.addAction(UIAlertAction(title: "Sign Out", style: .destructive) { [weak self] _ in
-            QobuzCredentialStore.shared.delete()
-            self?.tabControllers.removeAll()
-            self?.open(tab: .discover, direction: nil)
-        })
-        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        let presenter = topPresentedController()
-        if let popover = alert.popoverPresentationController {
-            popover.sourceView = presenter.view
-            popover.sourceRect = CGRect(x: presenter.view.bounds.midX, y: presenter.view.bounds.midY, width: 1, height: 1)
-        }
-        presenter.present(alert, animated: true)
+        showQobuzStreamTest()
     }
 
     private func showQobuzStreamTest(autoStartSignIn: Bool = false) {
@@ -1092,11 +1358,15 @@ final class RootViewController: UIViewController {
         controller.onAccountChanged = { [weak self] in
             guard let self = self else { return }
             let returnTab = self.appState.currentTab
+            self.resetAccountPlayback()
+            if self.playbackBackend == nil, let credentials = QobuzCredentialStore.shared.load() {
+                self.activateQobuzPlaybackBackend(credentials: credentials)
+            }
             self.tabControllers.removeAll()
             self.open(tab: returnTab, direction: nil)
         }
         controller.modalPresentationStyle = .fullScreen
-        present(controller, animated: true)
+        topPresentedController().present(controller, animated: true)
     }
 
     private func showLegacyQobuzStreamTest() {

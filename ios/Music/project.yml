@@ -31,6 +31,9 @@ targets:
         buildPhase: resources
       - path: Resources/LaunchScreen.storyboard
         buildPhase: resources
+      - path: Resources/EQ
+        type: folder
+        buildPhase: resources
     info:
       path: Info.plist
       properties:

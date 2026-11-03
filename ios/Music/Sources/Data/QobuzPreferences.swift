@@ -4,8 +4,12 @@ import UIKit
 enum QobuzPreferences {
     private static let qualityKey = "Music.Qobuz.streamQuality"
 
+    static var requestedQualityGuidance: String {
+        "Requested quality: \(quality.detail). Applies to the next stream. Availability depends on the track and your subscription. Actual output depends on your device and audio route; this does not guarantee bit-perfect playback."
+    }
+
     static var quality: QobuzStreamQuality {
-        get { QobuzStreamQuality(rawValue: UserDefaults.standard.integer(forKey: qualityKey)).flatMap { $0.rawValue == 0 ? nil : $0 } ?? .cd }
+        get { QobuzStreamQuality(rawValue: UserDefaults.standard.integer(forKey: qualityKey)) ?? .cd }
         set { UserDefaults.standard.set(newValue.rawValue, forKey: qualityKey) }
     }
 }

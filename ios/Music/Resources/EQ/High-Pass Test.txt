@@ -1,0 +1,6 @@
+# Diagnostic profile: a 1 kHz high-pass removes almost everything below 1 kHz.
+# Enable this profile on its own, with Headphones switched OFF, while a track
+# plays. If the sound does not turn thin and telephone-like, the equaliser is
+# not running.
+# Default: off
+Filter 1: ON HP Fc 1000 Hz Q 0.707

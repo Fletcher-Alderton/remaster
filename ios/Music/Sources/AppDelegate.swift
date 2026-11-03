@@ -12,7 +12,32 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
            let bundleIdentifier = Bundle.main.bundleIdentifier {
             UserDefaults.standard.removePersistentDomain(forName: bundleIdentifier)
         }
-        let window = UIWindow(frame: UIScreen.main.bounds)
+        var windowFrame = UIScreen.main.bounds
+        #if targetEnvironment(simulator)
+        if ProcessInfo.processInfo.arguments.contains("-ipod-preview") {
+            windowFrame = CGRect(
+                x: (windowFrame.width - DesignSystem.screenWidth) / 2,
+                y: (windowFrame.height - DesignSystem.screenHeight) / 2,
+                width: DesignSystem.screenWidth,
+                height: DesignSystem.screenHeight
+            )
+        }
+        #endif
+        if let url = Bundle.main.url(forResource: QobuzPersonalCredentialImport.resourceName, withExtension: "json") {
+            do {
+                try QobuzPersonalCredentialImport.importIfNeeded(data: Data(contentsOf: url)) {
+                    try QobuzCredentialStore.shared.save($0)
+                }
+            } catch {
+                // Never log the payload or decoded account credentials.
+                NSLog("Personal Qobuz credential import failed; use account sign-in to retry.")
+            }
+        }
+        // Ships the parametric EQ profiles in Resources/EQ into the profile library, so a
+        // personal correction does not have to be pasted in by hand on a fresh install.
+        EQProfileStore.shared.importBundledProfilesIfNeeded()
+
+        let window = UIWindow(frame: windowFrame)
         window.backgroundColor = DesignSystem.pageBackground
         window.rootViewController = RootViewController()
         window.makeKeyAndVisible()

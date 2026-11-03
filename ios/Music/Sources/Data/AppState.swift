@@ -25,6 +25,7 @@ final class AppState {
         self.tabConfiguration = AppState.decode(TabConfiguration.self, key: Key.tabConfiguration, defaults: defaults, decoder: decoder) ?? TabConfiguration()
         self.likedTrackIDs = Set(defaults.stringArray(forKey: Key.likedTrackIDs) ?? [])
         self.queueState = AppState.decode(QueueState.self, key: Key.queueState, defaults: defaults, decoder: decoder) ?? QueueState()
+        self.queueState.isPlaying = false
         self.lastFMUsername = defaults.string(forKey: Key.lastFMUsername)
         self.currentTab = tabConfiguration.enabledTabs.contains(.albums)
             ? .albums

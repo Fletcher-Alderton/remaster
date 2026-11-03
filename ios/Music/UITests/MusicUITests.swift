@@ -11,6 +11,17 @@ final class MusicUITests: XCTestCase {
         app.launch()
     }
 
+    func testIPodPreviewPreservesPortraitViewport() {
+        app.terminate()
+        app.launchArguments.append("-ipod-preview")
+        app.launch()
+        XCTAssertTrue(app.buttons["tab.discover"].waitForExistence(timeout: 3))
+        let frame = app.windows.firstMatch.frame
+        XCTAssertEqual(frame.width, 320, accuracy: 0.5)
+        XCTAssertEqual(frame.height, 568, accuracy: 0.5)
+        XCTAssertTrue(app.buttons["tab.tracks"].isHittable)
+    }
+
     func testOnlyQobuzTabsAreVisibleByDefault() {
         for tab in ["discover", "search", "albums", "artists", "tracks"] {
             XCTAssertTrue(app.buttons["tab.\(tab)"].waitForExistence(timeout: 3))
@@ -107,5 +118,58 @@ final class MusicUITests: XCTestCase {
         let start = app.coordinate(withNormalizedOffset: CGVector(dx: forward ? 0.995 : 0.005, dy: 0.65))
         let end = app.coordinate(withNormalizedOffset: CGVector(dx: forward ? 0.20 : 0.80, dy: 0.65))
         start.press(forDuration: 0.05, thenDragTo: end)
+    }
+}
+
+/// Live end-to-end check with a real Qobuz session (personal builds only). Skipped unless
+/// QOBUZ_LIVE_E2E_DIR is set; screenshots of each step are written to that directory.
+final class LiveQueuePickUITests: XCTestCase {
+    func testPickingFromQueueUpdatesNowPlaying() throws {
+        guard let directory = ProcessInfo.processInfo.environment["QOBUZ_LIVE_E2E_DIR"] else {
+            throw XCTSkip("Set TEST_RUNNER_QOBUZ_LIVE_E2E_DIR to run against a real Qobuz session")
+        }
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments.append("-reset-ui-test-state")
+        app.launch()
+        func shot(_ name: String) {
+            try? XCUIScreen.main.screenshot().pngRepresentation.write(to: URL(fileURLWithPath: "\(directory)/\(name).png"))
+        }
+        func label(_ id: String) -> String { app.staticTexts[id].label }
+
+        app.buttons["tab.albums"].tap()
+        let card = app.cells.matching(NSPredicate(format: "identifier BEGINSWITH 'qobuz.albumCard.'")).firstMatch
+        XCTAssertTrue(card.waitForExistence(timeout: 25), "saved albums did not load")
+        card.tap()
+        XCTAssertTrue(app.buttons["albumDetail.play"].waitForExistence(timeout: 20))
+        shot("1-album")
+        app.buttons["albumDetail.play"].tap()
+
+        let title = app.staticTexts["player.title"]
+        XCTAssertTrue(title.waitForExistence(timeout: 10))
+        let firstTitle = title.label
+        sleep(4)
+        shot("2-now-playing-\(firstTitle.prefix(20))")
+
+        let queueButton = app.buttons.matching(NSPredicate(format: "label CONTAINS 'up next'")).firstMatch
+        XCTAssertTrue(queueButton.waitForExistence(timeout: 5), "album needs at least 3 tracks")
+        queueButton.tap()
+        let queue = app.otherElements["queue"]
+        XCTAssertTrue(queue.waitForExistence(timeout: 5))
+        let rows = queue.tables.firstMatch.cells
+        XCTAssertGreaterThanOrEqual(rows.count, 2)
+        let picked = rows.element(boundBy: 1)
+        let rowTexts = picked.staticTexts.allElementsBoundByIndex.map { $0.label }
+        shot("3-queue")
+        picked.tap()
+
+        XCTAssertTrue(title.waitForExistence(timeout: 5))
+        let changed = NSPredicate(format: "label IN %@", rowTexts)
+        let updated = expectation(for: changed, evaluatedWith: title)
+        let result = XCTWaiter().wait(for: [updated], timeout: 8)
+        sleep(4)
+        shot("4-after-pick")
+        XCTAssertEqual(result, .completed, "Now Playing still shows '\(title.label)' (first: '\(firstTitle)'), picked row \(rowTexts)")
+        XCTAssertNotEqual(label("player.title"), firstTitle)
     }
 }

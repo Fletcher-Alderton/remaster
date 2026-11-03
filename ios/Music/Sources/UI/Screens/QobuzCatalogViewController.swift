@@ -134,6 +134,12 @@ final class QobuzCatalogViewController: UIViewController, UITableViewDataSource,
 
     private let mode: Mode
     private let client: QobuzStreamingClient
+    private let offlineMode: OfflineMode
+    private let offlineLibrary: () -> OfflineLibrary
+    private var offlineObserver: NSObjectProtocol?
+    /// Only a user-triggered refresh (second pull-down or Refresh) shows "Refreshing…".
+    private var isManualRefresh = false
+    private var showingOfflineLibrary = false
     private let table = UITableView(frame: .zero, style: .plain)
     private let searchBar = UISearchBar()
     private let statusLabel = UILabel()
@@ -180,11 +186,16 @@ final class QobuzCatalogViewController: UIViewController, UITableViewDataSource,
     private var hasMorePlaylists = false
     private var didRequestGenres = false
 
-    init(mode: Mode, client: QobuzStreamingClient) {
+    init(mode: Mode, client: QobuzStreamingClient, offlineMode: OfflineMode = .shared,
+         offlineLibrary: @escaping () -> OfflineLibrary = { .empty }) {
         self.mode = mode
         self.client = client
+        self.offlineMode = offlineMode
+        self.offlineLibrary = offlineLibrary
         super.init(nibName: nil, bundle: nil)
     }
+
+    deinit { if let observer = offlineObserver { NotificationCenter.default.removeObserver(observer) } }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
@@ -224,16 +235,60 @@ final class QobuzCatalogViewController: UIViewController, UITableViewDataSource,
             tagHeightConstraint
         ])
         configureContent()
+        offlineObserver = NotificationCenter.default.addObserver(forName: OfflineMode.didChange, object: offlineMode, queue: .main) { [weak self] _ in
+            self?.offlineModeChanged()
+        }
         if mode.isLibrary {
             toolsPan.cancelsTouchesInView = false
             toolsPan.delegate = self
             view.addGestureRecognizer(toolsPan)
             loadLibrary()
         } else if mode == .discover {
-            loadDiscovery()
+            if offlineMode.restrictsToDownloads { showOfflineDiscover() } else { loadDiscovery() }
         } else {
-            statusLabel.text = "Search the Qobuz catalog"
+            statusLabel.text = searchPrompt
         }
+    }
+
+    private var searchPrompt: String {
+        offlineMode.restrictsToDownloads ? "Offline · Search your downloads" : "Search the Qobuz catalog"
+    }
+
+    /// Going offline switches every tab to downloads; reconnecting (or the manual override)
+    /// brings the normal content back without the user doing anything.
+    private func offlineModeChanged() {
+        guard isViewLoaded else { return }
+        switch mode {
+        case .albums, .artists, .tracks:
+            guard !isManualRefresh else { return }  // the manual refresh is already loading everything
+            requestID += 1
+            isLoadingLibrary = false
+            loadLibrary()
+        case .discover:
+            if offlineMode.restrictsToDownloads { showOfflineDiscover() } else { loadDiscovery() }
+        case .search:
+            let query = (searchBar.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if query.isEmpty {
+                requestID += 1
+                rows = []
+                table.reloadData()
+                statusLabel.text = searchPrompt
+            } else {
+                search(query: query)
+            }
+        }
+    }
+
+    private func showOfflineDiscover() {
+        requestID += 1
+        discoveryGeneration = requestID
+        discoveryResponse = nil
+        let albums = offlineLibrary().albums
+        rows = albums.isEmpty ? [] : [.heading("DOWNLOADED")] + albums.map(Row.album)
+        statusLabel.text = albums.isEmpty
+            ? "Offline · Nothing downloaded yet. Discover returns when you reconnect."
+            : "Offline · Showing your downloads"
+        table.reloadData()
     }
 
     private func configureTools() {
@@ -348,8 +403,24 @@ final class QobuzCatalogViewController: UIViewController, UITableViewDataSource,
         }
     }
 
-    @objc private func refreshLibrary() { loadLibrary() }
+    @objc private func refreshLibrary() { refreshLibraryManually() }
     @objc private func librarySortChanged() { applyLibraryFilter() }
+
+    /// One pull-down at the top reveals search and sort; a second one refreshes and, when
+    /// offline, shows all content instead of downloads only.
+    func libraryPulledDown() {
+        guard mode.isLibrary else { return }
+        if !showingLibraryTools { setLibraryToolsVisible(true); return }
+        refreshLibraryManually()
+    }
+
+    private func refreshLibraryManually() {
+        isManualRefresh = true
+        offlineMode.showAllContent()
+        requestID += 1
+        isLoadingLibrary = false
+        loadLibrary(forceRefresh: true)
+    }
 
     // Reusable toggle preserves the active local search and sort when hidden.
     func setLibraryToolsVisible(_ visible: Bool, animated: Bool = true) {
@@ -378,7 +449,7 @@ final class QobuzCatalogViewController: UIViewController, UITableViewDataSource,
         guard gesture.state == .ended else { return }
         let translation = gesture.translation(in: view)
         if translation.y > 30 && (pullStartedAtTop || libraryIsAtTop) {
-            setLibraryToolsVisible(true)
+            libraryPulledDown()
         } else if showingLibraryTools && (translation.y < -20 || gesture.velocity(in: view).y < -240) {
             setLibraryToolsVisible(false)
         }
@@ -673,17 +744,33 @@ final class QobuzCatalogViewController: UIViewController, UITableViewDataSource,
         table.reloadData()
     }
 
-    private func loadLibrary() {
+    private func loadLibrary(forceRefresh: Bool = false) {
         guard mode.isLibrary, !isLoadingLibrary else { return }
-        isLoadingLibrary = true
         libraryError = nil
+        if offlineMode.restrictsToDownloads {
+            requestID += 1
+            let downloads = offlineLibrary()
+            switch mode {
+            case .albums: libraryRows = downloads.albums.map(Row.album)
+            case .artists: libraryRows = downloads.artists.map(Row.artist)
+            case .tracks: libraryRows = downloads.tracks.map(Row.track)
+            case .discover, .search: break
+            }
+            showingOfflineLibrary = true
+            didLoadLibrary = true
+            isManualRefresh = false
+            applyLibraryFilter()
+            return
+        }
+        isLoadingLibrary = true
         requestID += 1
         let currentRequest = requestID
         applyLibraryFilter()
-        client.library { [weak self] result in
+        client.library(forceRefresh: forceRefresh) { [weak self] result in
             DispatchQueue.main.async {
                 guard let self = self, self.requestID == currentRequest else { return }
                 self.isLoadingLibrary = false
+                self.isManualRefresh = false
                 switch result {
                 case .failure(let error):
                     // Keep an already loaded library available if refresh fails.
@@ -698,6 +785,7 @@ final class QobuzCatalogViewController: UIViewController, UITableViewDataSource,
                         self.libraryRows = (library.tracks?.items ?? []).map { .track(Self.screenTrack($0)) }
                     case .discover, .search: break
                     }
+                    self.showingOfflineLibrary = false
                     self.didLoadLibrary = true
                 }
                 self.applyLibraryFilter()
@@ -718,18 +806,29 @@ final class QobuzCatalogViewController: UIViewController, UITableViewDataSource,
             }
             return text.range(of: query, options: [.caseInsensitive, .diacriticInsensitive]) != nil
         }
-        if isLoadingLibrary {
-            statusLabel.text = didLoadLibrary ? "Refreshing your Qobuz library…" : "Loading your Qobuz library…"
+        let name = mode.accessibilityName
+        if isLoadingLibrary && isManualRefresh {
+            statusLabel.text = "Refreshing your Qobuz library…"
+        } else if isLoadingLibrary && !didLoadLibrary {
+            statusLabel.text = "Loading your Qobuz library…"
         } else if let error = libraryError {
             statusLabel.text = didLoadLibrary ? "Library refresh failed: \(error)" : error
+        } else if showingOfflineLibrary {
+            if rows.isEmpty {
+                statusLabel.text = query.isEmpty
+                    ? "Offline · No downloaded \(name). Pull down twice to show everything."
+                    : "Offline · No downloaded \(name) matching ‘\(query)’"
+            } else {
+                statusLabel.text = "Offline · \(rows.count) downloaded \(name)"
+            }
         } else if rows.isEmpty {
             statusLabel.text = query.isEmpty
-                ? "No saved \(mode.accessibilityName) in your Qobuz library."
-                : "No saved \(mode.accessibilityName) matching ‘\(query)’"
+                ? "No saved \(name) in your Qobuz library."
+                : "No saved \(name) matching ‘\(query)’"
         } else {
             statusLabel.text = query.isEmpty
-                ? "\(rows.count) saved \(mode.accessibilityName) · Qobuz library"
-                : "\(rows.count) saved \(mode.accessibilityName) matching ‘\(query)’"
+                ? "\(rows.count) saved \(name) · Qobuz library"
+                : "\(rows.count) saved \(name) matching ‘\(query)’"
         }
         // All restores native Qobuz order, not the previously sorted rows.
         if librarySort.selectedSegmentIndex == 1 || librarySort.selectedSegmentIndex == 2 {
@@ -742,7 +841,8 @@ final class QobuzCatalogViewController: UIViewController, UITableViewDataSource,
         }
         libraryRefreshButton.isEnabled = !isLoadingLibrary
         statusLabel.numberOfLines = rows.isEmpty ? 2 : 1
-        let needsStatus = rows.isEmpty || isLoadingLibrary || libraryError != nil
+        let visibleLoad = isLoadingLibrary && (isManualRefresh || !didLoadLibrary)
+        let needsStatus = rows.isEmpty || visibleLoad || libraryError != nil || showingOfflineLibrary
         statusLabel.isHidden = !needsStatus
         statusHeightConstraint.constant = rows.isEmpty ? 52 : (needsStatus ? 24 : 0)
         if mode == .albums { collection.reloadData() } else { table.reloadData() }
@@ -763,7 +863,11 @@ final class QobuzCatalogViewController: UIViewController, UITableViewDataSource,
         guard !mode.isLibrary else { applyLibraryFilter(); return }
         let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
         requestID += 1
-        guard !query.isEmpty else { rows = []; table.reloadData(); statusLabel.text = "Search the Qobuz catalog"; return }
+        guard !query.isEmpty else { rows = []; table.reloadData(); statusLabel.text = searchPrompt; return }
+        if offlineMode.restrictsToDownloads {
+            searchDownloads(query)
+            return
+        }
         let currentRequest = requestID
         statusLabel.text = "Searching Qobuz…"
         client.searchCatalog(query: query) { [weak self] result in
@@ -784,6 +888,23 @@ final class QobuzCatalogViewController: UIViewController, UITableViewDataSource,
                 }
             }
         }
+    }
+
+    /// Offline search runs locally over downloaded tracks, albums and artists.
+    private func searchDownloads(_ query: String) {
+        let downloads = offlineLibrary()
+        func matches(_ fields: [String]) -> Bool {
+            fields.joined(separator: " ").range(of: query, options: [.caseInsensitive, .diacriticInsensitive]) != nil
+        }
+        let tracks = downloads.tracks.filter { matches([$0.title, $0.artist, $0.album]) }
+        let albums = downloads.albums.filter { matches([$0.title, $0.artist]) }
+        let artists = downloads.artists.filter { matches([$0.name]) }
+        rows = []
+        if !tracks.isEmpty { rows.append(.heading("TRACKS")); rows.append(contentsOf: tracks.map(Row.track)) }
+        if !albums.isEmpty { rows.append(.heading("ALBUMS")); rows.append(contentsOf: albums.map(Row.album)) }
+        if !artists.isEmpty { rows.append(.heading("ARTISTS")); rows.append(contentsOf: artists.map(Row.artist)) }
+        statusLabel.text = rows.isEmpty ? "Offline · No downloads match ‘\(query)’" : "Offline · Downloaded results for ‘\(query)’"
+        table.reloadData()
     }
 
     private func loadPlaylistDetail(_ playlist: QobuzCatalogPlaylist) {
@@ -825,7 +946,7 @@ final class QobuzCatalogViewController: UIViewController, UITableViewDataSource,
         guard searchText.isEmpty else { return }
         rows = []
         table.reloadData()
-        statusLabel.text = "Search the Qobuz catalog"
+        statusLabel.text = searchPrompt
     }
 
     func numberOfSections(in tableView: UITableView) -> Int { 1 }

@@ -28,6 +28,7 @@ struct ScreenTrack {
 
 struct ScreenAlbum {
     let id: String
+    let releaseType: String?
     let title: String
     let artist: String
     let year: String
@@ -37,10 +38,17 @@ struct ScreenAlbum {
     let artworkURL: URL?
     let tracks: [ScreenTrack]
 
-    init(id: String, title: String, artist: String, year: String, genre: String = "", quality: String = "", artwork: UIImage? = nil, artworkURL: URL? = nil, tracks: [ScreenTrack] = []) {
+    init(id: String, title: String, artist: String, year: String, genre: String = "", quality: String = "", artwork: UIImage? = nil, artworkURL: URL? = nil, tracks: [ScreenTrack] = [], releaseType: String? = nil) {
+        self.releaseType = releaseType
         self.id = id; self.title = title; self.artist = artist; self.year = year; self.genre = genre
         self.quality = quality; self.artwork = artwork; self.artworkURL = artworkURL; self.tracks = tracks
     }
+}
+
+struct ScreenArtistReleaseSection {
+    let title: String
+    let albums: [ScreenAlbum]
+    let failed: Bool
 }
 
 struct ScreenProfile {
@@ -52,10 +60,12 @@ struct ScreenProfile {
     let artworkURL: URL?
     let albums: [ScreenAlbum]
     let tracks: [ScreenTrack]
+    let releaseSections: [ScreenArtistReleaseSection]
 
-    init(id: String, name: String, subtitle: String, information: String, artwork: UIImage? = nil, artworkURL: URL? = nil, albums: [ScreenAlbum] = [], tracks: [ScreenTrack] = []) {
+    init(id: String, name: String, subtitle: String, information: String, artwork: UIImage? = nil, artworkURL: URL? = nil, albums: [ScreenAlbum] = [], tracks: [ScreenTrack] = [], releaseSections: [ScreenArtistReleaseSection]? = nil) {
         self.id = id; self.name = name; self.subtitle = subtitle; self.information = information
         self.artwork = artwork; self.artworkURL = artworkURL; self.albums = albums; self.tracks = tracks
+        self.releaseSections = releaseSections ?? (albums.isEmpty ? [] : [ScreenArtistReleaseSection(title: "Albums", albums: albums, failed: false)])
     }
 }
 

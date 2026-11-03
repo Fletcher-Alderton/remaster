@@ -2,6 +2,26 @@ import Foundation
 
 /// Tolerant models for Qobuz's undocumented `/api.json/0.2` catalog responses.
 /// IDs vary between numeric and string values across endpoints.
+/// Verified artist/getReleasesList categories (qobine ReleaseType).
+/// epSingle cannot be split into EPs and Singles without additional API metadata.
+enum QobuzArtistReleaseCategory: String, CaseIterable {
+    case albums = "album", epsAndSingles = "epSingle", live = "live", compilations = "compilation"
+    var title: String {
+        switch self {
+        case .albums: return "Albums"
+        case .epsAndSingles: return "EPs & Singles"
+        case .live: return "Live Releases"
+        case .compilations: return "Compilations"
+        }
+    }
+}
+
+struct QobuzArtistReleaseSection {
+    let category: QobuzArtistReleaseCategory
+    let albums: [QobuzCatalogAlbum]
+    let failed: Bool
+}
+
 struct QobuzCatalogArtist: Decodable {
     let id: String
     let name: String
@@ -14,6 +34,7 @@ struct QobuzCatalogArtist: Decodable {
     let topTracks: [QobuzSearchTrack]
     /// Non-nil when some release categories/pages could not be loaded.
     let releasesError: String?
+    let releaseSections: [QobuzArtistReleaseSection]?
 
     enum CodingKeys: String, CodingKey {
         case id, name, picture, image, information, biography, albums
@@ -33,6 +54,7 @@ struct QobuzCatalogArtist: Decodable {
         albums = try container.decodeIfPresent(QobuzCatalogPage<QobuzCatalogAlbum>.self, forKey: .albums)
         topTracks = try container.decodeIfPresent([QobuzSearchTrack].self, forKey: .topTracks) ?? []
         releasesError = nil
+        releaseSections = nil
     }
 
     init(
@@ -45,7 +67,8 @@ struct QobuzCatalogArtist: Decodable {
         biography: QobuzCatalogBiography? = nil,
         albums: QobuzCatalogPage<QobuzCatalogAlbum>? = nil,
         topTracks: [QobuzSearchTrack] = [],
-        releasesError: String? = nil
+        releasesError: String? = nil,
+        releaseSections: [QobuzArtistReleaseSection]? = nil
     ) {
         self.id = id
         self.name = name
@@ -57,6 +80,7 @@ struct QobuzCatalogArtist: Decodable {
         self.albums = albums
         self.topTracks = topTracks
         self.releasesError = releasesError
+        self.releaseSections = releaseSections
     }
 
     var artworkURL: URL? {
@@ -160,6 +184,8 @@ struct QobuzCatalogGenre: Decodable {
 struct QobuzCatalogAlbum: Decodable {
     let id: String
     let title: String
+    /// Preserve the server value; unknown or absent types are not guessed.
+    let releaseType: String?
     let artist: QobuzCatalogArtist?
     let image: QobuzCatalogImage?
     let genre: QobuzCatalogGenre?
@@ -172,6 +198,7 @@ struct QobuzCatalogAlbum: Decodable {
 
     enum CodingKeys: String, CodingKey {
         case id, title, artist, image, genre, duration, tracks
+        case releaseType = "release_type"
         case releaseDate = "release_date_original"
         case releasedAt = "released_at"
         case maximumBitDepth = "maximum_bit_depth"
@@ -182,6 +209,7 @@ struct QobuzCatalogAlbum: Decodable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decodeFlexibleID(forKey: .id)
         title = try container.decode(String.self, forKey: .title)
+        releaseType = try? container.decode(String.self, forKey: .releaseType)
         artist = try container.decodeIfPresent(QobuzCatalogArtist.self, forKey: .artist)
         image = try container.decodeIfPresent(QobuzCatalogImage.self, forKey: .image)
         genre = try container.decodeIfPresent(QobuzCatalogGenre.self, forKey: .genre)
@@ -204,10 +232,12 @@ struct QobuzCatalogAlbum: Decodable {
         duration: Int? = nil,
         maximumBitDepth: Int? = nil,
         maximumSamplingRate: Double? = nil,
-        tracks: QobuzCatalogTrackPage? = nil
+        tracks: QobuzCatalogTrackPage? = nil,
+        releaseType: String? = nil
     ) {
         self.id = id
         self.title = title
+        self.releaseType = releaseType
         self.artist = artist
         self.image = image
         self.genre = genre
@@ -321,6 +351,8 @@ struct QobuzCatalogDiscoverySection<Item: Decodable>: Decodable {
 struct QobuzCatalogDiscoveryAlbum: Decodable {
     let id: String
     let title: String
+    /// Preserve the server value; unknown or absent types are not guessed.
+    let releaseType: String?
     let artists: [QobuzCatalogDiscoveryArtist]?
     let artist: QobuzCatalogDiscoveryArtist?
     let image: QobuzCatalogImage?
@@ -330,6 +362,7 @@ struct QobuzCatalogDiscoveryAlbum: Decodable {
 
     enum CodingKeys: String, CodingKey {
         case id, title, artists, artist, image, duration, dates
+        case releaseType = "release_type"
         case releaseDate = "release_date_original"
     }
 
@@ -337,6 +370,7 @@ struct QobuzCatalogDiscoveryAlbum: Decodable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decodeFlexibleID(forKey: .id)
         title = try container.decode(String.self, forKey: .title)
+        releaseType = try? container.decode(String.self, forKey: .releaseType)
         artists = try container.decodeIfPresent([QobuzCatalogDiscoveryArtist].self, forKey: .artists)
         artist = try container.decodeIfPresent(QobuzCatalogDiscoveryArtist.self, forKey: .artist)
         image = try container.decodeIfPresent(QobuzCatalogImage.self, forKey: .image)
@@ -513,5 +547,70 @@ private extension KeyedDecodingContainer {
         if let value = try? decode(String.self, forKey: key) { return value }
         if let value = try? decode(Int64.self, forKey: key) { return String(value) }
         throw DecodingError.typeMismatch(String.self, .init(codingPath: codingPath + [key], debugDescription: "Expected a string or numeric catalog ID."))
+    }
+}
+
+/// Only account fields consumed by the current Qobuz web player. Missing
+/// subscription information is unknown, not evidence of an inactive plan.
+struct QobuzAccountResponse: Decodable {
+    let user: User
+    struct User: Decodable {
+        let id: String
+        let email: String?
+        let credential: Credential?
+        let subscription: Subscription?
+        enum CodingKeys: String, CodingKey { case id, email, credential, subscription }
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            id = try c.decodeFlexibleID(forKey: .id)
+            email = try? c.decode(String.self, forKey: .email)
+            credential = try? c.decode(Credential.self, forKey: .credential)
+            subscription = try? c.decode(Subscription.self, forKey: .subscription)
+        }
+    }
+    struct Credential: Decodable {
+        let description: String?
+        let parameters: Parameters?
+        enum CodingKeys: String, CodingKey { case description, parameters }
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            description = try? c.decode(String.self, forKey: .description)
+            parameters = try? c.decode(Parameters.self, forKey: .parameters)
+        }
+    }
+    struct Parameters: Decodable {
+        let shortLabel: String?
+        let losslessStreaming: Bool?
+        let offlineStreaming: Bool?
+        enum CodingKeys: String, CodingKey { case shortLabel, losslessStreaming, offlineStreaming }
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            shortLabel = try? c.decode(String.self, forKey: .shortLabel)
+            losslessStreaming = try? c.decode(Bool.self, forKey: .losslessStreaming)
+            offlineStreaming = try? c.decode(Bool.self, forKey: .offlineStreaming)
+        }
+    }
+    struct Subscription: Decodable {
+        let offer: String?
+        let periodicity: String?
+        enum CodingKeys: String, CodingKey { case offer, periodicity }
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            offer = try? c.decode(String.self, forKey: .offer)
+            periodicity = try? c.decode(String.self, forKey: .periodicity)
+        }
+    }
+    var displaySummary: String {
+        var lines = ["Signed in to Qobuz."]
+        if let email = user.email, !email.isEmpty { lines.append(email) }
+        let plan = user.credential?.parameters?.shortLabel ?? user.credential?.description
+        lines.append(plan.map { "Plan: \($0)" } ?? "Plan information unavailable.")
+        if let offer = user.subscription?.offer, !offer.isEmpty { lines.append("Subscription offer: \(offer)") }
+        if let period = user.subscription?.periodicity, !period.isEmpty { lines.append("Billing period: \(period)") }
+        if let lossless = user.credential?.parameters?.losslessStreaming {
+            lines.append("Lossless streaming entitlement: " + (lossless ? "Yes" : "No"))
+        }
+        lines.append("Playback availability is checked for each stream. Manage billing and subscriptions on the Qobuz website.")
+        return lines.joined(separator: "\n")
     }
 }

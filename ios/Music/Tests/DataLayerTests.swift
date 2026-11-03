@@ -1,5 +1,6 @@
 import XCTest
 import UIKit
+import AVFoundation
 @testable import Music
 
 private final class StubQobuzStreamResolver: QobuzStreamResolving {
@@ -156,6 +157,163 @@ private final class TestAlbumLongPressRecognizer: UILongPressGestureRecognizer {
 }
 
 final class DataLayerTests: XCTestCase {
+    func testQobuzCoverVariantsMatchRetinaDisplayPixels() {
+        let original = URL(string: "https://static.qobuz.com/images/covers/56/94/0886446519456_org.jpg")!
+        // iPod touch 6: 320 pt wide at 2x. Cards are (320 - 44) / 2 pt.
+        let cases: [(Int, String)] = [
+            (1, "50"), (50, "50"), (80, "100"), (108, "230"),
+            (120, "230"), (144, "230"), (204, "230"), (230, "230"),
+            (276, "300"), (300, "300"), (504, "600"), (600, "600"), (640, "max")
+        ]
+        for (pixels, size) in cases {
+            XCTAssertEqual(ArtworkImagePipeline.preferredRemoteURL(for: original, maximumPixelSize: pixels).lastPathComponent,
+                           "0886446519456_\(size).jpg")
+        }
+        let small = URL(string: "https://static.qobuz.com/images/covers/56/94/0886446519456_50.jpg")!
+        XCTAssertEqual(ArtworkImagePipeline.preferredRemoteURL(for: small, maximumPixelSize: 640).lastPathComponent,
+                       "0886446519456_max.jpg")
+    }
+
+    func testQobuzPortraitVariantsAndUnknownURLsRemainSafe() {
+        let portrait = URL(string: "https://static.qobuz.com/images/artists/covers/large/portrait.jpg")!
+        for (pixels, size) in [(108, "small"), (144, "small"), (380, "small"), (640, "medium"), (1141, "large")] {
+            XCTAssertEqual(ArtworkImagePipeline.preferredRemoteURL(for: portrait, maximumPixelSize: pixels).path,
+                           "/images/artists/covers/\(size)/portrait.jpg")
+        }
+        for string in [
+            "https://example.invalid/images/covers/cover_org.jpg",
+            "https://static.qobuz.com/images/covers/cover_org.jpg?signature=test",
+            "https://static.qobuz.com/images/covers/cover_org.jpg#fragment",
+            "https://static.qobuz.com/images/covers/cover_org.png",
+            "https://static.qobuz.com/images/playlists/banner.jpg",
+            "https://static.qobuz.com/images/artists/covers/original/portrait.jpg"
+        ] {
+            let url = URL(string: string)!
+            XCTAssertEqual(ArtworkImagePipeline.preferredRemoteURL(for: url, maximumPixelSize: 108), url)
+        }
+    }
+
+    func testQobuzArtworkVariantFallsBackAndCachesByOriginalDisplaySize() {
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [QobuzCatalogURLProtocol.self]
+        let session = URLSession(configuration: config)
+        let pipeline = ArtworkImagePipeline(session: session)
+        defer { session.invalidateAndCancel(); QobuzCatalogURLProtocol.handler = nil }
+        let url = URL(string: "https://static.qobuz.com/images/covers/test_org.jpg")!
+        let image = UIGraphicsImageRenderer(size: CGSize(width: 400, height: 400)).image { context in
+            UIColor.red.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 400, height: 400))
+        }
+        let data = image.jpegData(compressionQuality: 0.8)!
+        var requested: [String] = []
+        QobuzCatalogURLProtocol.handler = { request in
+            requested.append(request.url!.lastPathComponent)
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Accept"), "image/jpeg, image/png;q=0.9")
+            return request.url == url ? (200, data) : (404, Data())
+        }
+        let done = expectation(description: "fallback decoded")
+        pipeline.image(forRemoteURL: url, maximumPixelSize: 108) { image in
+            XCTAssertEqual(image?.cgImage?.width, 108)
+            XCTAssertEqual(image?.cgImage?.height, 108)
+            done.fulfill()
+        }
+        wait(for: [done], timeout: 3)
+        XCTAssertEqual(requested, ["test_230.jpg", "test_org.jpg"])
+        XCTAssertNotNil(pipeline.cachedImage(for: "remote|\(url.absoluteString)|108"))
+        let cached = expectation(description: "cached completion")
+        pipeline.image(forRemoteURL: url, maximumPixelSize: 108) { image in
+            XCTAssertNotNil(image)
+            cached.fulfill()
+        }
+        wait(for: [cached], timeout: 3)
+        XCTAssertEqual(requested.count, 2)
+    }
+
+    func testQobuzArtworkVariantSuccessDoesNotFetchOriginal() {
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [QobuzCatalogURLProtocol.self]
+        let session = URLSession(configuration: config)
+        let pipeline = ArtworkImagePipeline(session: session)
+        defer { session.invalidateAndCancel(); QobuzCatalogURLProtocol.handler = nil }
+        let image = UIGraphicsImageRenderer(size: CGSize(width: 640, height: 640)).image { context in
+            UIColor.blue.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 640, height: 640))
+        }
+        var requests = 0
+        QobuzCatalogURLProtocol.handler = { request in
+            requests += 1
+            XCTAssertEqual(request.url?.lastPathComponent, "test_max.jpg")
+            return (200, image.jpegData(compressionQuality: 0.8)!)
+        }
+        let done = expectation(description: "player cover decoded")
+        pipeline.image(forRemoteURL: URL(string: "https://static.qobuz.com/images/covers/test_org.jpg")!, maximumPixelSize: 640) { image in
+            XCTAssertEqual(image?.cgImage?.width, 640)
+            done.fulfill()
+        }
+        wait(for: [done], timeout: 3)
+        XCTAssertEqual(requests, 1)
+    }
+
+    func testPlaybackAudioSessionSharesControlCenterMusicRoute() throws {
+        let session = AVAudioSession.sharedInstance()
+        let category = session.category
+        let mode = session.mode
+        let policy = session.routeSharingPolicy
+        let options = session.categoryOptions
+        defer { try? session.setCategory(category, mode: mode, policy: policy, options: options) }
+
+        try QobuzStreamPlayer.configurePlaybackAudioSession()
+
+        XCTAssertEqual(session.category, .playback)
+        XCTAssertEqual(session.mode, .default)
+        XCTAssertEqual(session.routeSharingPolicy, .longFormAudio)
+        XCTAssertFalse(session.categoryOptions.contains(.mixWithOthers))
+    }
+
+    func testPersonalQobuzCredentialsImportOnceAndAllowReplacement() throws {
+        let suite = "PersonalQobuzImportTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        func payload(_ id: String, token: String = "test-token", userID: Int = 42) throws -> Data {
+            return try JSONSerialization.data(withJSONObject: [
+                "importID": id,
+                "credentials": ["userAuthToken": token, "userID": userID]
+            ])
+        }
+        var saved: [QobuzCredentials] = []
+        let first = try payload("first")
+        try QobuzPersonalCredentialImport.importIfNeeded(data: first, defaults: defaults) { saved.append($0) }
+        // Subsequent launches must not undo a user's sign-out.
+        try QobuzPersonalCredentialImport.importIfNeeded(data: first, defaults: defaults) { saved.append($0) }
+        XCTAssertEqual(saved.count, 1)
+        XCTAssertEqual(saved.first?.userID, 42)
+        try QobuzPersonalCredentialImport.importIfNeeded(data: payload("replacement"), defaults: defaults) { saved.append($0) }
+        XCTAssertEqual(saved.count, 2)
+    }
+
+    func testPersonalQobuzImportRejectsInvalidPayloadAndRetriesFailedSave() throws {
+        let suite = "PersonalQobuzImportTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        for json in [
+            "{}",
+            #"{"importID":"","credentials":{"userAuthToken":"test","userID":42}}"#,
+            #"{"importID":"one","credentials":{"userAuthToken":" ","userID":42}}"#,
+            #"{"importID":"one","credentials":{"userAuthToken":"test","userID":0}}"#
+        ] {
+            XCTAssertThrowsError(try QobuzPersonalCredentialImport.importIfNeeded(data: Data(json.utf8), defaults: defaults) { _ in
+                XCTFail("Invalid credentials must not be saved")
+            })
+        }
+        let data = Data(#"{"importID":"one","credentials":{"userAuthToken":"test","userID":42}}"#.utf8)
+        XCTAssertThrowsError(try QobuzPersonalCredentialImport.importIfNeeded(data: data, defaults: defaults) { _ in
+            throw QobuzStreamingError.keychain(-1)
+        })
+        var saved = false
+        try QobuzPersonalCredentialImport.importIfNeeded(data: data, defaults: defaults) { _ in saved = true }
+        XCTAssertTrue(saved)
+    }
+
     func testQobuzMP3RequestSignatureMatchesQobineProtocol() {
         XCTAssertEqual(
             QobuzStreamingClient.requestSignature(trackID: 64_868_955, timestamp: "1700000000", secret: "secret"),
@@ -402,6 +560,73 @@ final class DataLayerTests: XCTestCase {
         XCTAssertNil(["file:///private/image.jpg", ""].map(Optional.some).catalogArtworkURL)
     }
 
+    func testRootStartupPreservesInjectedPlaybackQueue() {
+        let backend = StubPresentationPlayback()
+        backend.emit(QueueState(trackIDs: ["701", "702", "701"], currentIndex: 1, elapsed: 37, isPlaying: false))
+        let root = RootViewController(playbackBackend: backend)
+        root.loadViewIfNeeded()
+        XCTAssertEqual(backend.queueState.trackIDs, ["701", "702", "701"])
+        XCTAssertEqual(backend.queueState.currentIndex, 1)
+        XCTAssertEqual(backend.queueState.elapsed, 37)
+        XCTAssertTrue(backend.selections.isEmpty)
+    }
+
+    func testAlbumFavoriteFormEncodingAndAuthentication() throws {
+        for token in ["test-token", "a.b.c.d"] {
+            for saved in [true, false] {
+                let session = catalogTestSession { request in
+                    XCTAssertEqual(request.httpMethod, "POST")
+                    XCTAssertEqual(request.url?.path, "/api.json/0.2/favorite/" + (saved ? "create" : "delete"))
+                    XCTAssertNil(request.url?.query)
+                    XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/x-www-form-urlencoded")
+                    XCTAssertEqual(request.value(forHTTPHeaderField: "X-App-Id"), "test-app-id")
+                    XCTAssertEqual(request.value(forHTTPHeaderField: token == "test-token" ? "X-User-Auth-Token" : "Authorization"), token == "test-token" ? token : "Bearer " + token)
+                    var body = request.httpBody
+                    if body == nil, let stream = request.httpBodyStream {
+                        stream.open(); defer { stream.close() }
+                        var bytes = [UInt8](repeating: 0, count: 1024)
+                        var data = Data()
+                        while stream.hasBytesAvailable {
+                            let count = stream.read(&bytes, maxLength: bytes.count)
+                            if count <= 0 { break }
+                            data.append(contentsOf: bytes.prefix(count))
+                        }
+                        body = data
+                    }
+                    XCTAssertEqual(String(data: body ?? Data(), encoding: .utf8), "album_ids=a%20%2B%26%3D%2F%C3%A9")
+                    return (200, Data(#"{"status":"success"}"#.utf8))
+                }
+                let client = QobuzStreamingClient(credentials: QobuzCredentials(userAuthToken: token, userID: 1), session: session, catalogAppID: "test-app-id")
+                let done = expectation(description: "favorite confirmed")
+                client.setAlbumFavorite(id: "a +&=/é", isSaved: saved) { result in
+                    if case .failure(let error) = result { XCTFail(error.localizedDescription) }
+                    done.fulfill()
+                }
+                wait(for: [done], timeout: 3)
+                session.invalidateAndCancel(); QobuzCatalogURLProtocol.handler = nil
+            }
+        }
+    }
+
+    func testAlbumFavoriteRejectsHTTPJSONAndMalformedErrors() {
+        for (status, json) in [(403, #"{"message":"Denied"}"#), (200, #"{"status":"error","message":"Denied"}"#), (200, #"{"error":{"message":"Denied"}}"#), (200, "not-json")] {
+            let session = catalogTestSession { _ in (status, Data(json.utf8)) }
+            let client = QobuzStreamingClient(credentials: QobuzCredentials(userAuthToken: "test-token", userID: 1), session: session, catalogAppID: "test-app-id")
+            let done = expectation(description: "favorite rejected")
+            client.setAlbumFavorite(id: "album", isSaved: true) { result in
+                if case .success = result { XCTFail("Must reject server failure") }
+                done.fulfill()
+            }
+            wait(for: [done], timeout: 3)
+            session.invalidateAndCancel(); QobuzCatalogURLProtocol.handler = nil
+        }
+        let client = QobuzStreamingClient(credentials: QobuzCredentials(userAuthToken: "  ", userID: 1), catalogAppID: "test-app-id")
+        client.setAlbumFavorite(id: "album", isSaved: true) { result in
+            guard case .failure(let error) = result else { return XCTFail("Authentication required") }
+            XCTAssertEqual(error.localizedDescription, QobuzStreamingError.notAuthenticated.localizedDescription)
+        }
+    }
+
     func testQobuzSavedLibraryRequestsAuthenticatedFavoritesAndPaginatesEveryGroup() throws {
         var requestedOffsets: [Int] = []
         let session = catalogTestSession { request in
@@ -461,6 +686,75 @@ final class DataLayerTests: XCTestCase {
             guard case .failure(let error) = result else { return XCTFail("Expected authentication failure") }
             XCTAssertEqual(error.localizedDescription, QobuzStreamingError.notAuthenticated.localizedDescription)
         }
+    }
+
+    func testArtistReleaseSectionsPreserveCategoryPaginationAndPartialFailures() throws {
+        let session = catalogTestSession { request in
+            if request.url?.path.hasSuffix("artist/page") == true {
+                return (200, Data(#"{"id":42,"name":"Artist","top_tracks":[]}"#.utf8))
+            }
+            let query = self.queryValues(request)
+            let category = query["release_type"] ?? ""
+            let offset = Int(query["offset"] ?? "0") ?? 0
+            if category == "live" { return (500, Data()) }
+            let ids = category == "album" ? (offset == 0 ? ["shared", "album"] : ["album", "later"]) : ["shared"]
+            let items = ids.map { ["id": $0, "title": "Misleading Single EP Live title"] }
+            return (200, try JSONSerialization.data(withJSONObject: ["has_more": category == "album" && offset == 0, "items": items]))
+        }
+        defer { session.invalidateAndCancel(); QobuzCatalogURLProtocol.handler = nil }
+        let client = QobuzStreamingClient(credentials: QobuzCredentials(userAuthToken: "test-token", userID: 1), session: session, catalogAppID: "test-app-id")
+        let done = expectation(description: "artist categories")
+        var result: Result<QobuzCatalogArtist, Error>?
+        client.artist(id: "42") { result = $0; done.fulfill() }
+        wait(for: [done], timeout: 3)
+        let profile = QobuzCatalogMapper.profile(try XCTUnwrap(result).get())
+        let controller = ProfileDetailViewController(profile: profile)
+        controller.loadViewIfNeeded()
+        let table = try XCTUnwrap(controller.view.subviews.compactMap { $0 as? UITableView }.first)
+        let headings = (0..<controller.numberOfSections(in: table)).compactMap { section -> String? in
+            guard let header = controller.tableView(table, viewForHeaderInSection: section) else { return nil }
+            return self.descendants(of: header).compactMap { $0 as? UILabel }.first?.text
+        }
+        XCTAssertEqual(headings, ["Albums", "EPs & Singles", "Live Releases — Loading failed", "Compilations"])
+        XCTAssertEqual(controller.tableView(table, numberOfRowsInSection: 0), 2, "Album pagination deduplicates inside its category")
+        XCTAssertTrue(profile.subtitle.contains("Releases incomplete"))
+    }
+
+    func testArtistExplicitReleaseMetadataSeparatesEPsAndSinglesWithoutGuessing() throws {
+        let data = Data(#"{"items":[{"id":"ep","title":"Single","release_type":"epmini"},{"id":"single","title":"EP","release_type":"single"},{"id":"unknown","title":"EP Single","release_type":"future-type"}],"has_more":false}"#.utf8)
+        let page = try JSONDecoder().decode(QobuzCatalogPage<QobuzCatalogDiscoveryAlbum>.self, from: data)
+        let albums = page.items.map(QobuzCatalogMapper.catalogAlbum)
+        let profile = QobuzCatalogMapper.profile(QobuzCatalogArtist(id: "42", name: "Artist", releaseSections: [
+            QobuzArtistReleaseSection(category: .epsAndSingles, albums: albums, failed: false)
+        ]))
+        XCTAssertEqual(profile.releaseSections.map(\.title), ["EPs", "Singles", "EPs & Singles"])
+        XCTAssertEqual(profile.releaseSections.map { $0.albums.map(\.id) }, [["ep"], ["single"], ["unknown"]])
+        XCTAssertEqual(albums.map(\.releaseType), ["epmini", "single", "future-type"])
+        XCTAssertEqual(profile.releaseSections.flatMap(\.albums).map(\.releaseType), ["epmini", "single", "future-type"])
+    }
+
+    func testArtistTopTrackCoverIsLazySizedAndClearedOnReuse() throws {
+        XCTAssertTrue(URLProtocol.registerClass(UnexpectedArtworkURLProtocol.self))
+        defer { URLProtocol.unregisterClass(UnexpectedArtworkURLProtocol.self); ArtworkImagePipeline.shared.removeAll() }
+        let url = URL(string: "https://artwork-regression.invalid/top-\(UUID().uuidString).jpg")!
+        let cached = preloadArtwork(url: url, pointSize: 44, color: .red)
+        let track = ScreenTrack(id: "701", title: "Long top track title", artist: "Artist", album: "Album", artworkURL: url)
+        let controller = ProfileDetailViewController(profile: ScreenProfile(id: "42", name: "Artist", subtitle: "", information: "", tracks: [track]))
+        controller.loadViewIfNeeded()
+        let table = try XCTUnwrap(controller.view.subviews.compactMap { $0 as? UITableView }.first)
+        let path = IndexPath(row: 0, section: 0)
+        let cell = controller.tableView(table, cellForRowAt: path)
+        let art = try XCTUnwrap(descendants(of: cell).compactMap { $0 as? ArtworkView }.first, "Top tracks need album covers")
+        XCTAssertNil(art.image, "Configuring an offscreen row must not load artwork")
+        table.delegate?.tableView?(table, willDisplay: cell, forRowAt: path)
+        XCTAssertTrue(art.image === cached)
+        cell.prepareForReuse()
+        XCTAssertNil(art.image, "Reused rows must immediately clear their previous cover")
+        layout(controller, size: CGSize(width: 320, height: 568))
+        let visible = try XCTUnwrap(table.cellForRow(at: path))
+        let visibleArt = try XCTUnwrap(descendants(of: visible).compactMap { $0 as? ArtworkView }.first)
+        XCTAssertEqual(visibleArt.bounds.width, 44, accuracy: 0.5)
+        XCTAssertFalse(visibleArt.hasAmbiguousLayout)
     }
 
     func testQobuzArtistLoadsHasMorePagesAndAllReleaseCategories() throws {
@@ -1312,8 +1606,8 @@ final class DataLayerTests: XCTestCase {
         drainMainQueue()
         XCTAssertTrue(ControlledArtworkURLProtocol.requestedURLs.isEmpty)
         XCTAssertNil(art.image)
-        controller.tableView(table, willDisplay: cell, forRowAt: path)
-        controller.tableView(table, willDisplay: cell, forRowAt: path)
+        table.delegate?.tableView?(table, willDisplay: cell, forRowAt: path)
+        table.delegate?.tableView?(table, willDisplay: cell, forRowAt: path)
         waitForMainCondition("display starts one intercepted request") { ControlledArtworkURLProtocol.hasPending(url) }
         XCTAssertEqual(ControlledArtworkURLProtocol.requestedURLs, [url], "Repeated display must coalesce the size-specific request")
         let pixels = artworkPixels(60)
@@ -1531,6 +1825,17 @@ final class DataLayerTests: XCTestCase {
             XCTAssertEqual(backend.queueState.currentTrackID, upcoming.id)
             XCTAssertTrue(backend.queueState.isPlaying, "Selecting an upcoming row preserves active transport")
             waitForMainCondition("queue selection dismisses queue back to player") { player.presentedViewController == nil }
+            let shownTitle = try XCTUnwrap(descendants(of: player.view).compactMap { $0 as? UILabel }.first { $0.accessibilityIdentifier == "player.title" })
+            XCTAssertEqual(shownTitle.text, upcoming.title, "Now Playing must show the song picked from the Queue")
+            XCTAssertTrue(descendants(of: player.view).compactMap { $0 as? UIImageView }.contains { $0.image != nil && $0.image !== playerImage },
+                          "Now Playing artwork must change with the picked song")
+            backend.emit(QueueState(trackIDs: [current.id, current.id], currentIndex: 0, isPlaying: true))
+            let title = try XCTUnwrap(descendants(of: player.view).compactMap { $0 as? UILabel }.first { $0.accessibilityIdentifier == "player.title" })
+            title.layer.removeAllAnimations()
+            backend.emit(QueueState(trackIDs: [current.id, current.id], currentIndex: 1, isPlaying: true))
+            let transition = try XCTUnwrap(title.layer.animation(forKey: "transition") as? CATransition,
+                                          "Advancing to a duplicate song occurrence must animate through Root wiring")
+            XCTAssertEqual(transition.subtype, .fromRight)
             let dismissed = expectation(description: "root regression modal cleanup")
             root.dismiss(animated: false) { dismissed.fulfill() }
             wait(for: [dismissed], timeout: 3)
@@ -1765,4 +2070,212 @@ final class DataLayerTests: XCTestCase {
         XCTAssertEqual(saved["libraryTabsVersion"] as? Int, 1)
         XCTAssertEqual(AppState(defaults: defaults).tabConfiguration.enabledTabs, [.tracks])
     }
+}
+
+/// Screen text and artwork must not be fetched again when a screen is revisited.
+final class CatalogAndArtworkCachingTests: XCTestCase {
+    private var directory: URL!
+
+    override func setUp() {
+        super.setUp()
+        directory = FileManager.default.temporaryDirectory.appendingPathComponent("cache-tests-\(UUID().uuidString)")
+    }
+
+    override func tearDown() {
+        QobuzCatalogURLProtocol.handler = nil
+        try? FileManager.default.removeItem(at: directory)
+        super.tearDown()
+    }
+
+    private func session(_ handler: @escaping (URLRequest) throws -> (Int, Data)) -> URLSession {
+        QobuzCatalogURLProtocol.handler = handler
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [QobuzCatalogURLProtocol.self]
+        return URLSession(configuration: configuration)
+    }
+
+    private func loadTrack(_ client: QobuzStreamingClient) -> Result<QobuzSearchTrack, Error> {
+        let done = expectation(description: "track")
+        var outcome: Result<QobuzSearchTrack, Error>!
+        client.track(id: "7") { outcome = $0; done.fulfill() }
+        wait(for: [done], timeout: 3)
+        return outcome
+    }
+
+    func testRevisitedCatalogTextIsServedFromCacheEvenAfterRelaunch() throws {
+        var requests = 0
+        let urlSession = session { _ in requests += 1; return (200, Data(#"{"id":7,"title":"Cached"}"#.utf8)) }
+        defer { urlSession.invalidateAndCancel() }
+        let credentials = QobuzCredentials(userAuthToken: "test-token", userID: 9)
+        let cache = QobuzCatalogResponseCache(directory: directory)
+        let client = QobuzStreamingClient(credentials: credentials, session: urlSession, catalogAppID: "app", catalogCache: cache)
+        XCTAssertEqual(try loadTrack(client).get().title, "Cached")
+        XCTAssertEqual(try loadTrack(client).get().title, "Cached")
+        XCTAssertEqual(requests, 1, "Second visit must come from memory")
+        cache.flush()
+        // A fresh cache instance on the same directory simulates an app relaunch (disk only).
+        let relaunched = QobuzStreamingClient(credentials: credentials, session: urlSession, catalogAppID: "app",
+                                              catalogCache: QobuzCatalogResponseCache(directory: directory))
+        XCTAssertEqual(try loadTrack(relaunched).get().title, "Cached")
+        XCTAssertEqual(requests, 1, "Relaunch must read the disk cache")
+    }
+
+    func testCatalogCacheIsPerAccountAndFallsBackWhenOffline() throws {
+        var online = true
+        var requests = 0
+        let urlSession = session { _ in
+            requests += 1
+            guard online else { throw URLError(.notConnectedToInternet) }
+            return (200, Data(#"{"id":7,"title":"Stale but shown"}"#.utf8))
+        }
+        defer { urlSession.invalidateAndCancel() }
+        let cache = QobuzCatalogResponseCache(directory: directory)
+        let first = QobuzStreamingClient(credentials: QobuzCredentials(userAuthToken: "a", userID: 1), session: urlSession, catalogAppID: "app", catalogCache: cache)
+        _ = try loadTrack(first).get()
+        let other = QobuzStreamingClient(credentials: QobuzCredentials(userAuthToken: "b", userID: 2), session: urlSession, catalogAppID: "app", catalogCache: cache)
+        _ = try loadTrack(other).get()
+        XCTAssertEqual(requests, 2, "Accounts must not share cached responses")
+
+        // Expire the fresh window for account 1, then go offline: the old copy is still shown.
+        let key = QobuzCatalogResponseCache.key(accountID: 1, path: "track/get", queryItems: [URLQueryItem(name: "track_id", value: "7")])
+        XCTAssertNotNil(cache.data(forKey: key, maxAge: 60))
+        XCTAssertNil(cache.data(forKey: key, maxAge: 0))
+        online = false
+        cache.flush()
+        cache.trimMemory()
+        let staleOnly = QobuzStreamingClient(credentials: QobuzCredentials(userAuthToken: "a", userID: 1), session: urlSession, catalogAppID: "app",
+                                             catalogCache: cache)
+        XCTAssertEqual(try loadTrack(staleOnly).get().title, "Stale but shown")
+    }
+
+    func testErrorsAndPostsAreNeverCachedAndFavoritesAreInvalidatedAfterSaving() {
+        var status = 500
+        let urlSession = session { request in
+            if request.httpMethod == "POST" { return (200, Data(#"{"status":"success"}"#.utf8)) }
+            return (status, Data(#"{"id":7,"title":"Track"}"#.utf8))
+        }
+        defer { urlSession.invalidateAndCancel() }
+        let cache = QobuzCatalogResponseCache(directory: directory)
+        let client = QobuzStreamingClient(credentials: QobuzCredentials(userAuthToken: "t", userID: 3), session: urlSession, catalogAppID: "app", catalogCache: cache)
+        if case .success = loadTrack(client) { XCTFail("A 500 with nothing cached must fail") }
+        status = 200
+        XCTAssertNoThrow(try loadTrack(client).get(), "The earlier failure must not have been cached")
+
+        let favoritesKey = QobuzCatalogResponseCache.key(accountID: 3, path: "favorite/getUserFavorites", queryItems: [])
+        cache.store(Data("{}".utf8), forKey: favoritesKey)
+        XCTAssertNotNil(cache.data(forKey: favoritesKey, maxAge: 60))
+        let saved = expectation(description: "saved")
+        client.setAlbumFavorite(id: "album", isSaved: true) { _ in saved.fulfill() }
+        wait(for: [saved], timeout: 3)
+        XCTAssertNil(cache.data(forKey: favoritesKey, maxAge: 60), "Saving an album must drop the cached library")
+    }
+
+    func testArtworkIsReusedFromDiskAndByPlainURLLookup() {
+        var requests = 0
+        let image = UIGraphicsImageRenderer(size: CGSize(width: 300, height: 300)).image { context in
+            UIColor.green.setFill(); context.fill(CGRect(x: 0, y: 0, width: 300, height: 300))
+        }
+        let jpeg = image.jpegData(compressionQuality: 0.8)!
+        let urlSession = session { _ in requests += 1; return (200, jpeg) }
+        defer { urlSession.invalidateAndCancel() }
+        let url = URL(string: "https://example.com/artwork/cover.jpg")!
+        let disk = ArtworkDiskCache(directory: directory)
+        let pipeline = ArtworkImagePipeline(session: urlSession, diskCache: disk)
+        let first = expectation(description: "downloaded")
+        pipeline.image(forRemoteURL: url, maximumPixelSize: 120) { XCTAssertNotNil($0); first.fulfill() }
+        wait(for: [first], timeout: 3)
+        XCTAssertEqual(requests, 1)
+        XCTAssertNotNil(pipeline.cachedImage(for: url.absoluteString), "Screens that look up by plain URL must hit the cache")
+
+        // After a memory warning (or a relaunch), artwork is decoded from disk, not downloaded.
+        pipeline.removeAll()
+        disk.flush()
+        let other = ArtworkImagePipeline(session: urlSession, diskCache: disk)
+        let again = expectation(description: "from disk")
+        other.image(forRemoteURL: url, maximumPixelSize: 240) { XCTAssertEqual($0?.cgImage?.width, 240); again.fulfill() }
+        wait(for: [again], timeout: 3)
+        XCTAssertEqual(requests, 1)
+    }
+}
+
+/// Same Root → Now Playing → Queue → pick path as above, but with the real Qobuz
+/// playback controller and AVQueuePlayer (offline files), as on the iPod.
+@MainActor
+final class QueuePickRealBackendTests: XCTestCase {
+    private func all(_ view: UIView) -> [UIView] { view.subviews.flatMap { [$0] + all($0) } }
+
+    private func waitFor(_ description: String, timeout: TimeInterval = 5, _ condition: @escaping () -> Bool) {
+        let done = expectation(description: description)
+        var fulfilled = false
+        func poll() {
+            if condition() { if !fulfilled { fulfilled = true; done.fulfill() }; return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: poll)
+        }
+        poll()
+        wait(for: [done], timeout: timeout)
+    }
+
+    private func tone(_ url: URL, seconds: Double) throws {
+        let format = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1)!
+        let file = try AVAudioFile(forWriting: url, settings: format.settings)
+        let frames = AVAudioFrameCount(seconds * 44_100)
+        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames)!
+        buffer.frameLength = frames
+        try file.write(from: buffer)
+    }
+
+    func testPickingASongFromQueueUpdatesNowPlaying() throws {
+        let defaults = UserDefaults.standard
+        let keys = ["Music.AppState.tabConfiguration", "Music.AppState.queueState"]
+        let saved = keys.map { defaults.object(forKey: $0) }
+        defaults.set(Data(#"{"enabledTabs":["settings"],"libraryTabsVersion":1}"#.utf8), forKey: keys[0])
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("pick-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer {
+            for (key, value) in zip(keys, saved) { if let value = value { defaults.set(value, forKey: key) } else { defaults.removeObject(forKey: key) } }
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let tracks = ["101": "First Song", "202": "Second Song", "303": "Third Song"]
+        var files: [String: URL] = [:]
+        for id in tracks.keys { files[id] = directory.appendingPathComponent("\(id).caf"); try tone(files[id]!, seconds: 20) }
+        let provider: (String) -> ScreenTrack? = { id in tracks[id].map { ScreenTrack(id: id, title: $0, artist: "Artist", album: "Album", duration: 20) } }
+        let backend = QobuzPlaybackController(client: NoResolution(), quality: { .cd }, trackProvider: provider,
+            offlineStream: { id, _ in files[String(id)].map { QobuzTrackURL(url: $0, formatID: 6, mimeType: "audio/x-caf", samplingRate: 44.1, bitDepth: 16) } })
+        let root = RootViewController(playbackBackend: backend, presentationTrackProvider: provider)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 320, height: 568))
+        window.rootViewController = root
+        window.makeKeyAndVisible()
+        defer { backend.pause(); root.dismiss(animated: false); window.isHidden = true; window.rootViewController = nil }
+
+        backend.setQueue(trackIDs: ["101", "202", "303"], startingAt: 0)
+        backend.play()
+        let mini = try XCTUnwrap(all(root.view).compactMap { $0 as? MiniPlayerView }.first)
+        waitFor("mini player shows first song") { mini.titleLabel.text == "First Song" }
+        mini.onOpenPlayer?()
+        waitFor("player open") { root.presentedViewController is PlayerViewController }
+        let player = try XCTUnwrap(root.presentedViewController as? PlayerViewController)
+        player.view.layoutIfNeeded()
+        func title() -> String? { all(player.view).compactMap { $0 as? UILabel }.first { $0.accessibilityIdentifier == "player.title" }?.text }
+        XCTAssertEqual(title(), "First Song")
+        waitFor("first song playing") { backend.queueState.isPlaying && backend.queueState.elapsed > 0.2 }
+
+        player.onOpenQueue?()
+        waitFor("queue open") { player.presentedViewController is QueueViewController }
+        let queue = try XCTUnwrap(player.presentedViewController as? QueueViewController)
+        queue.view.layoutIfNeeded()
+        let table = try XCTUnwrap(all(queue.view).compactMap { $0 as? UITableView }.first)
+        queue.tableView(table, didSelectRowAt: IndexPath(row: 1, section: 0))  // "Third Song"
+        waitFor("queue dismissed") { player.presentedViewController == nil }
+        XCTAssertEqual(backend.queueState.currentTrackID, "303")
+        waitFor("Now Playing shows the picked song", timeout: 3) { title() == "Third Song" }
+        XCTAssertEqual(mini.titleLabel.text, "Third Song")
+        waitFor("picked song plays and its time moves", timeout: 5) { backend.queueState.isPlaying && backend.queueState.elapsed > 0.3 }
+        let elapsed = all(player.view).compactMap { $0 as? UILabel }.map { $0.text ?? "" }
+        XCTAssertTrue(elapsed.contains("0:00") || elapsed.contains("0:01"), "Now Playing time follows the new song: \(elapsed)")
+    }
+}
+
+private final class NoResolution: QobuzStreamResolving {
+    func requestStreamURL(trackID: Int64, quality: QobuzStreamQuality, progress: @escaping (String) -> Void,
+                          completion: @escaping (Result<QobuzTrackURL, Error>) -> Void) {}
 }

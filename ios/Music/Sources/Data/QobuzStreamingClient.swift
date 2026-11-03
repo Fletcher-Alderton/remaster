@@ -223,6 +223,33 @@ enum QobuzStreamingError: LocalizedError {
     }
 }
 
+enum QobuzPersonalCredentialImport {
+    static let resourceName = "QobuzPersonalCredentials"
+    private static let importedIDKey = "qobuz.personalCredentialImportID"
+
+    private struct Payload: Decodable {
+        let importID: String
+        let credentials: QobuzCredentials
+    }
+
+    static func importIfNeeded(
+        data: Data,
+        defaults: UserDefaults = .standard,
+        save: (QobuzCredentials) throws -> Void
+    ) throws {
+        let payload = try JSONDecoder().decode(Payload.self, from: data)
+        guard !payload.importID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !payload.credentials.userAuthToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              payload.credentials.userID > 0 else {
+            throw QobuzStreamingError.invalidResponse
+        }
+        guard defaults.string(forKey: importedIDKey) != payload.importID else { return }
+        try save(payload.credentials)
+        // Mark only after Keychain succeeds; keep sign-out effective on later launches.
+        defaults.set(payload.importID, forKey: importedIDKey)
+    }
+}
+
 /// Stores the OAuth token in the system Keychain rather than app preferences.
 final class QobuzCredentialStore {
     static let shared = QobuzCredentialStore()
@@ -383,6 +410,189 @@ private enum QobuzSearchCache {
     }
 }
 
+/// Memory + disk cache for Qobuz catalog JSON (albums, artists, playlists, discovery,
+/// library), so moving between screens doesn't refetch text that was just shown.
+/// Entries are scoped per account; only allow-listed GET endpoints are cached.
+final class QobuzCatalogResponseCache {
+    static let shared = QobuzCatalogResponseCache(
+        directory: FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("QobuzCatalog", isDirectory: true)
+    )
+
+    /// How long an entry is served without asking Qobuz again. Unlisted paths are never cached.
+    static func freshness(forPath path: String) -> TimeInterval? {
+        switch path {
+        case "album/get", "track/get", "playlist/get", "artist/page", "artist/getReleasesList": return 24 * 60 * 60
+        case "genre/list": return 7 * 24 * 60 * 60
+        case "discover/index", "discover/playlists": return 60 * 60
+        case "album/search", "artist/search", "track/search": return 15 * 60
+        case "favorite/getUserFavorites": return 10 * 60
+        default: return nil
+        }
+    }
+
+    /// When Qobuz can't be reached, older entries are still better than an error screen.
+    static let staleFallbackInterval: TimeInterval = 7 * 24 * 60 * 60
+    private static let memoryLimitBytes = 8 * 1_024 * 1_024
+    private static let diskLimitBytes = 60 * 1_024 * 1_024
+
+    private struct MemoryEntry { let data: Data; let storedAt: Date; var lastUsed: Date }
+
+    private let directory: URL
+    private let lock = NSLock()
+    private var memory: [String: MemoryEntry] = [:]
+    private var memoryBytes = 0
+    private let ioQueue = DispatchQueue(label: "Music.QobuzCatalogResponseCache", qos: .utility)
+    private var writesSincePrune = 0
+
+    init(directory: URL) {
+        self.directory = directory
+    }
+
+    static func key(accountID: Int64, path: String, queryItems: [URLQueryItem]) -> String {
+        let query = queryItems
+            .map { ($0.name, $0.value ?? "") }
+            .sorted { $0 < $1 }
+            .map { "\($0.0)=\($0.1)" }
+            .joined(separator: "&")
+        return "\(accountID)|\(path)|\(query)"
+    }
+
+    /// Returns cached data no older than `maxAge`, from memory first and then disk.
+    func data(forKey key: String, maxAge: TimeInterval) -> Data? {
+        let now = Date()
+        lock.lock()
+        if var entry = memory[key] {
+            let age = now.timeIntervalSince(entry.storedAt)
+            if age >= 0, age < maxAge {
+                entry.lastUsed = now
+                memory[key] = entry
+                lock.unlock()
+                return entry.data
+            }
+            lock.unlock()
+            return nil
+        }
+        lock.unlock()
+        let file = fileURL(forKey: key)
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: file.path),
+              let storedAt = attributes[.modificationDate] as? Date else { return nil }
+        let age = now.timeIntervalSince(storedAt)
+        guard age >= 0, age < maxAge, let data = try? Data(contentsOf: file) else { return nil }
+        remember(data, forKey: key, storedAt: storedAt)
+        return data
+    }
+
+    func store(_ data: Data, forKey key: String) {
+        let now = Date()
+        remember(data, forKey: key, storedAt: now)
+        let file = fileURL(forKey: key)
+        ioQueue.async { [weak self] in
+            guard let self = self else { return }
+            try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? data.write(to: file, options: .atomic)
+            self.writesSincePrune += 1
+            if self.writesSincePrune >= 25 {
+                self.writesSincePrune = 0
+                self.pruneDisk()
+            }
+        }
+    }
+
+    /// Drop every cached response for one endpoint, e.g. favorites after a save/unsave.
+    func removeAll(accountID: Int64, path: String) {
+        let prefix = "\(accountID)|\(path)|"
+        lock.lock()
+        for (key, entry) in memory where key.hasPrefix(prefix) {
+            memoryBytes -= entry.data.count
+            memory.removeValue(forKey: key)
+        }
+        lock.unlock()
+        let folder = folderURL(accountID: accountID, path: path)
+        ioQueue.sync { try? FileManager.default.removeItem(at: folder) }
+    }
+
+    /// Clears everything, e.g. on sign-out.
+    func removeAll() {
+        lock.lock()
+        memory.removeAll()
+        memoryBytes = 0
+        lock.unlock()
+        ioQueue.sync { try? FileManager.default.removeItem(at: directory) }
+    }
+
+    func trimMemory() {
+        lock.lock()
+        memory.removeAll()
+        memoryBytes = 0
+        lock.unlock()
+    }
+
+    /// Waits for pending disk writes (used by tests).
+    func flush() {
+        ioQueue.sync {}
+    }
+
+    // MARK: - Private
+
+    private func remember(_ data: Data, forKey key: String, storedAt: Date) {
+        guard data.count <= Self.memoryLimitBytes / 2 else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        if let old = memory[key] { memoryBytes -= old.data.count }
+        memory[key] = MemoryEntry(data: data, storedAt: storedAt, lastUsed: Date())
+        memoryBytes += data.count
+        while memoryBytes > Self.memoryLimitBytes,
+              let oldest = memory.min(by: { $0.value.lastUsed < $1.value.lastUsed }) {
+            memoryBytes -= oldest.value.data.count
+            memory.removeValue(forKey: oldest.key)
+        }
+    }
+
+    private func folderURL(accountID: Int64, path: String) -> URL {
+        let safePath = path.replacingOccurrences(of: "/", with: "_")
+        return directory
+            .appendingPathComponent(String(accountID), isDirectory: true)
+            .appendingPathComponent(safePath, isDirectory: true)
+    }
+
+    private func fileURL(forKey key: String) -> URL {
+        let parts = key.split(separator: "|", maxSplits: 2, omittingEmptySubsequences: false)
+        let accountID = parts.count > 0 ? Int64(parts[0]) ?? 0 : 0
+        let path = parts.count > 1 ? String(parts[1]) : "unknown"
+        let bytes = Array(key.utf8)
+        var digest = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
+        _ = CC_SHA256(bytes, CC_LONG(bytes.count), &digest)
+        let name = digest.map { String(format: "%02x", $0) }.joined()
+        return folderURL(accountID: accountID, path: path).appendingPathComponent(name + ".json")
+    }
+
+    /// Keep the on-disk cache bounded by deleting the oldest responses first.
+    private func pruneDisk() {
+        let keys: [URLResourceKey] = [.contentModificationDateKey, .totalFileAllocatedSizeKey, .isRegularFileKey]
+        guard let enumerator = FileManager.default.enumerator(at: directory, includingPropertiesForKeys: keys) else { return }
+        var files: [(URL, Date, Int)] = []
+        var total = 0
+        for case let url as URL in enumerator {
+            guard let values = try? url.resourceValues(forKeys: Set(keys)), values.isRegularFile == true else { continue }
+            let size = values.totalFileAllocatedSize ?? 0
+            let date = values.contentModificationDate ?? .distantPast
+            if Date().timeIntervalSince(date) > Self.staleFallbackInterval {
+                try? FileManager.default.removeItem(at: url)
+                continue
+            }
+            files.append((url, date, size))
+            total += size
+        }
+        guard total > Self.diskLimitBytes else { return }
+        for (url, _, size) in files.sorted(by: { $0.1 < $1.1 }) {
+            try? FileManager.default.removeItem(at: url)
+            total -= size
+            if total <= Self.diskLimitBytes * 3 / 4 { break }
+        }
+    }
+}
+
 private enum QobuzWebPlayerCache {
     private static let key = "qobuz.webPlayerConfiguration.v1"
     private static let expirationInterval: TimeInterval = 8 * 60 * 60
@@ -489,14 +699,23 @@ final class QobuzStreamingClient: QobuzStreamResolving {
     private let session: URLSession
     private let resolutionTimeout: TimeInterval
     private let catalogAppID: String?
+    private let catalogCache: QobuzCatalogResponseCache?
 
     /// Supplying a catalog app ID allows isolated URLProtocol tests without changing the player cache.
     /// Normal app callers leave it nil and discover the current web-player configuration.
-    init(credentials: QobuzCredentials, session: URLSession = .shared, resolutionTimeout: TimeInterval = 45, catalogAppID: String? = nil) {
+    /// App screens pass `.shared` for `catalogCache`; tests leave it nil so responses never leak between cases.
+    init(
+        credentials: QobuzCredentials,
+        session: URLSession = .shared,
+        resolutionTimeout: TimeInterval = 45,
+        catalogAppID: String? = nil,
+        catalogCache: QobuzCatalogResponseCache? = nil
+    ) {
         self.credentials = credentials
         self.session = session
         self.resolutionTimeout = resolutionTimeout
         self.catalogAppID = catalogAppID
+        self.catalogCache = catalogCache
     }
 
     static func authorizationURL(appID: String) -> URL? {
@@ -540,6 +759,27 @@ final class QobuzStreamingClient: QobuzStreamResolving {
                 completion(.failure(error))
             }
         }.resume()
+    }
+
+    /// Authenticated session read, matching the web player's user/login flow.
+    /// No password, subscription writes, or billing parameters are sent.
+    func account(completion: @escaping (Result<QobuzAccountResponse, Error>) -> Void) {
+        guard !credentials.userAuthToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            completion(.failure(QobuzStreamingError.notAuthenticated)); return
+        }
+        discoverCatalogAppID { result in
+            switch result {
+            case .failure(let error): completion(.failure(error))
+            case .success(let appID):
+                self.performCatalogRequest(path: "user/login", queryItems: [], appID: appID, method: "POST") { result in
+                    completion(result.flatMap { data in Result {
+                        let account = try JSONDecoder().decode(QobuzAccountResponse.self, from: data)
+                        guard account.user.id == String(self.credentials.userID) else { throw QobuzStreamingError.unauthorized }
+                        return account
+                    } })
+                }
+            }
+        }
     }
 
     func searchTracks(query: String, completion: @escaping (Result<[QobuzSearchTrack], Error>) -> Void) {
@@ -733,7 +973,8 @@ final class QobuzStreamingClient: QobuzStreamResolving {
 
     /// One authenticated favorites endpoint supplies all three saved-library groups.
     /// Qobine requests limit=1000; each group also reports its own offset/limit/total.
-    func library(completion: @escaping (Result<QobuzCatalogLibraryResponse, Error>) -> Void) {
+    /// `forceRefresh` skips cached favorites (used by the explicit Refresh button).
+    func library(forceRefresh: Bool = false, completion: @escaping (Result<QobuzCatalogLibraryResponse, Error>) -> Void) {
         guard !credentials.userAuthToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             completion(.failure(QobuzStreamingError.notAuthenticated))
             return
@@ -749,7 +990,7 @@ final class QobuzStreamingClient: QobuzStreamResolving {
                     self.performCatalogRequest(path: "favorite/getUserFavorites", queryItems: [
                         URLQueryItem(name: "limit", value: "1000"),
                         URLQueryItem(name: "offset", value: String(offset))
-                    ], appID: appID) { result in
+                    ], appID: appID, bypassCache: forceRefresh) { result in
                         do {
                             let response = try JSONDecoder().decode(QobuzCatalogLibraryResponse.self, from: result.get())
                             guard response.albums != nil || response.artists != nil || response.tracks != nil else {
@@ -778,6 +1019,46 @@ final class QobuzStreamingClient: QobuzStreamResolving {
                     }
                 }
                 load(offset: 0)
+            }
+        }
+    }
+
+    func setAlbumFavorite(id: String, isSaved: Bool, completion: @escaping (Result<Void, Error>) -> Void) {
+        guard !credentials.userAuthToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            completion(.failure(QobuzStreamingError.notAuthenticated))
+            return
+        }
+        discoverCatalogAppID { result in
+            switch result {
+            case .failure(let error): completion(.failure(error))
+            case .success(let appID):
+                self.performCatalogRequest(path: isSaved ? "favorite/create" : "favorite/delete", queryItems: [
+                    URLQueryItem(name: "album_ids", value: id)
+                ], appID: appID, method: "POST") { result in
+                    // Saved albums changed (or may have); never show the old favorites list again.
+                    self.catalogCache?.removeAll(accountID: self.credentials.userID, path: "favorite/getUserFavorites")
+                    completion(result.flatMap { data in Result {
+                        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                            throw QobuzStreamingError.invalidResponse
+                        }
+                        if object["error"] != nil || (object["status"] as? String)?.lowercased() == "error" {
+                            let nested = object["error"] as? [String: Any]
+                            throw QobuzStreamingError.api((object["message"] as? String) ?? (nested?["message"] as? String) ?? (object["error"] as? String) ?? "Qobuz could not update the saved album.")
+                        }
+                    } })
+                }
+            }
+        }
+    }
+
+    func track(id: String, completion: @escaping (Result<QobuzSearchTrack, Error>) -> Void) {
+        discoverCatalogAppID { result in
+            switch result {
+            case .failure(let error): completion(.failure(error))
+            case .success(let appID):
+                self.performCatalogRequest(path: "track/get", queryItems: [URLQueryItem(name: "track_id", value: id)], appID: appID) { result in
+                    completion(result.flatMap { data in Result { try JSONDecoder().decode(QobuzSearchTrack.self, from: data) } })
+                }
             }
         }
     }
@@ -812,8 +1093,8 @@ final class QobuzStreamingClient: QobuzStreamResolving {
                     case .success(let pageData):
                         do {
                             let page = try JSONDecoder().decode(QobuzCatalogArtistPage.self, from: pageData)
-                            self.loadArtistReleases(id: id, appID: appID) { releases, warning in
-                                completion(.success(QobuzCatalogMapper.artistPage(page, releases: releases, releasesError: warning)))
+                            self.loadArtistReleases(id: id, appID: appID) { releases, warning, sections in
+                                completion(.success(QobuzCatalogMapper.artistPage(page, releases: releases, releasesError: warning, releaseSections: sections)))
                             }
                         } catch {
                             completion(.failure(error))
@@ -832,31 +1113,33 @@ final class QobuzStreamingClient: QobuzStreamResolving {
     private func loadArtistReleases(
         id: String,
         appID: String,
-        completion: @escaping (QobuzCatalogPage<QobuzCatalogDiscoveryAlbum>?, String?) -> Void
+        completion: @escaping (QobuzCatalogPage<QobuzCatalogDiscoveryAlbum>?, String?, [QobuzArtistReleaseSection]) -> Void
     ) {
-        let categories = ["album", "epSingle", "live", "compilation"]
+        let categories = QobuzArtistReleaseCategory.allCases
         var releases: [QobuzCatalogDiscoveryAlbum] = []
         var seen = Set<String>()
         var failedCategories: [String] = []
+        var sections: [QobuzArtistReleaseSection] = []
         func loadCategory(_ index: Int) {
             guard index < categories.count else {
                 let warning = failedCategories.isEmpty ? nil
                     : "Some artist releases could not be loaded (\(failedCategories.joined(separator: ", ")))."
-                completion(QobuzCatalogPage(items: releases, total: warning == nil ? releases.count : nil), warning)
+                completion(QobuzCatalogPage(items: releases, total: warning == nil ? releases.count : nil), warning, sections)
                 return
             }
             let category = categories[index]
             var accumulator = QobuzCatalogAccumulator<QobuzCatalogDiscoveryAlbum>()
             func finishCategory(failed: Bool) {
                 releases += accumulator.items.filter { seen.insert($0.id).inserted }
-                if failed { failedCategories.append(category) }
+                sections.append(QobuzArtistReleaseSection(category: category, albums: accumulator.items.map(QobuzCatalogMapper.catalogAlbum), failed: failed))
+                if failed { failedCategories.append(category.rawValue) }
                 loadCategory(index + 1)
             }
             func loadPage(offset: Int) {
                 self.performCatalogRequest(path: "artist/getReleasesList", queryItems: [
                     URLQueryItem(name: "artist_id", value: id),
                     URLQueryItem(name: "limit", value: "100"),
-                    URLQueryItem(name: "release_type", value: category),
+                    URLQueryItem(name: "release_type", value: category.rawValue),
                     URLQueryItem(name: "sort", value: "release_date"),
                     URLQueryItem(name: "offset", value: String(offset)),
                     URLQueryItem(name: "track_size", value: "1")
@@ -880,11 +1163,36 @@ final class QobuzStreamingClient: QobuzStreamResolving {
         path: String,
         queryItems: [URLQueryItem],
         appID: String,
+        method: String = "GET",
+        bypassCache: Bool = false,
         completion: @escaping (Result<Data, Error>) -> Void
     ) {
+        var cacheKey: String?
+        if method == "GET", let cache = catalogCache,
+           let maxAge = QobuzCatalogResponseCache.freshness(forPath: path) {
+            let key = QobuzCatalogResponseCache.key(accountID: credentials.userID, path: path, queryItems: queryItems)
+            cacheKey = key
+            if !bypassCache, let data = cache.data(forKey: key, maxAge: maxAge) {
+                DispatchQueue.global(qos: .userInitiated).async { completion(.success(data)) }
+                return
+            }
+        }
+        let catalogCache = self.catalogCache
+        func staleFallback() -> Data? {
+            guard let key = cacheKey else { return nil }
+            return catalogCache?.data(forKey: key, maxAge: QobuzCatalogResponseCache.staleFallbackInterval)
+        }
         var components = URLComponents(url: Self.apiBase.appendingPathComponent(path), resolvingAgainstBaseURL: false)!
-        components.queryItems = queryItems
+        components.queryItems = method == "GET" ? queryItems : nil
         var request = URLRequest(url: components.url!)
+        request.httpMethod = method
+        if method == "POST" {
+            let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~"))
+            request.httpBody = queryItems.map {
+                $0.name.addingPercentEncoding(withAllowedCharacters: allowed)! + "=" + ($0.value ?? "").addingPercentEncoding(withAllowedCharacters: allowed)!
+            }.joined(separator: "&").data(using: .utf8)
+            request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        }
         request.timeoutInterval = Self.requestTimeout
         request.setValue(appID, forHTTPHeaderField: "X-App-Id")
         if credentials.userAuthToken.filter({ $0 == "." }).count == 3 {
@@ -893,12 +1201,21 @@ final class QobuzStreamingClient: QobuzStreamResolving {
             request.setValue(credentials.userAuthToken, forHTTPHeaderField: "X-User-Auth-Token")
         }
         session.dataTask(with: request) { data, response, error in
-            if let error = error { completion(.failure(error)); return }
+            if let error = error {
+                // Offline or Qobuz unreachable: show what was last loaded instead of an error.
+                if let stale = staleFallback() { completion(.success(stale)) }
+                else { completion(.failure(error)) }
+                return
+            }
             guard let data = data, let http = response as? HTTPURLResponse else {
                 completion(.failure(QobuzStreamingError.invalidResponse))
                 return
             }
             guard (200..<300).contains(http.statusCode) else {
+                if http.statusCode >= 500, let stale = staleFallback() {
+                    completion(.success(stale))
+                    return
+                }
                 completion(.failure(QobuzStreamingError.catalogRequestFailure(
                     path: path,
                     statusCode: http.statusCode,
@@ -906,8 +1223,17 @@ final class QobuzStreamingClient: QobuzStreamResolving {
                 )))
                 return
             }
+            if let key = cacheKey, Self.looksLikeJSON(data) {
+                catalogCache?.store(data, forKey: key)
+            }
             completion(.success(data))
         }.resume()
+    }
+
+    /// Avoid caching HTML error pages or empty bodies that came back with a 2xx status.
+    private static func looksLikeJSON(_ data: Data) -> Bool {
+        guard let first = data.first(where: { ![0x20, 0x09, 0x0A, 0x0D].contains($0) }) else { return false }
+        return first == UInt8(ascii: "{") || first == UInt8(ascii: "[")
     }
 
     func requestStreamURL(

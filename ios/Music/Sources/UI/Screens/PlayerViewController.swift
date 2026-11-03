@@ -33,9 +33,22 @@ final class PlayerViewController: UIViewController, UIGestureRecognizerDelegate 
     private var state: PlayerScreenState
     private var acceptsTapGestures = false
     private var hasAppliedArtworkState = false
+    private let reduceMotionEnabled: () -> Bool
+    private var occurrenceID: String?
+    private var gestureDirection: SongChangeDirection?
+    // Core Animation stores CATransition under its reserved transition key.
+    private static let songChangeAnimationKey = "transition"
 
-    init(state: PlayerScreenState) {
+    enum SongChangeDirection {
+        case next, previous
+    }
+
+    // An occurrence identifies a queue entry, not its metadata or downloaded artwork.
+    init(state: PlayerScreenState, occurrenceID: String? = nil,
+         reduceMotionEnabled: @escaping () -> Bool = { UIAccessibility.isReduceMotionEnabled }) {
         self.state = state
+        self.occurrenceID = occurrenceID
+        self.reduceMotionEnabled = reduceMotionEnabled
         super.init(nibName: nil, bundle: nil)
         modalPresentationStyle = .fullScreen
         modalPresentationCapturesStatusBarAppearance = true
@@ -56,6 +69,7 @@ final class PlayerViewController: UIViewController, UIGestureRecognizerDelegate 
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
+        NSLog("NPDIAG player.viewDidAppear title=%@ state=%@", titleLabel.text ?? "nil", state.track.title)
         acceptsTapGestures = false
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) { [weak self] in
             guard let self = self,
@@ -77,10 +91,25 @@ final class PlayerViewController: UIViewController, UIGestureRecognizerDelegate 
         qualityLabel.numberOfLines = 2
     }
 
-    func update(state: PlayerScreenState, animated: Bool = true) {
+    func update(state: PlayerScreenState, occurrenceID: String? = nil,
+                direction: SongChangeDirection? = nil, animated: Bool = true) {
         let playbackStateChanged = self.state.isPlaying != state.isPlaying
+        let occurrenceChanged = occurrenceID != nil && self.occurrenceID != nil && occurrenceID != self.occurrenceID
+        let songChanged = self.state.track.id != state.track.id || occurrenceChanged
         self.state = state
+        if let occurrenceID = occurrenceID { self.occurrenceID = occurrenceID }
+        if songChanged {
+            NSLog("NPDIAG player.update songChanged new=%@ title=%@ loaded=%@ window=%@ shown=%@", state.track.id, state.track.title,
+                  isViewLoaded ? "yes" : "no", viewIfLoaded?.window == nil ? "nil" : "yes", titleLabel.text ?? "nil")
+        }
         guard isViewLoaded else { return }
+        if songChanged {
+            // Same-key replacement prevents overlapping transitions on rapid skips.
+            // Only the content layers participate: playback sizing, shadows, waveform,
+            // and controls keep their independent animation and interaction state.
+            let shouldTransition = animated && view.window.map { !$0.isHidden } == true
+            transitionSongContent(direction: direction ?? gestureDirection, animated: shouldTransition)
+        }
         qualityLabel.textColor = DesignSystem.secondaryText
         qualityLabel.numberOfLines = 1
         artworkView.image = state.track.artwork
@@ -96,6 +125,29 @@ final class PlayerViewController: UIViewController, UIGestureRecognizerDelegate 
         if !hasAppliedArtworkState || playbackStateChanged {
             applyArtworkState(isPlaying: state.isPlaying, animated: animated && hasAppliedArtworkState)
             hasAppliedArtworkState = true
+        }
+        if songChanged {
+            NSLog("NPDIAG player.update applied title=%@ alpha=%.2f hidden=%@ anims=%@", titleLabel.text ?? "nil", titleLabel.alpha,
+                  titleLabel.isHidden ? "yes" : "no", (titleLabel.layer.animationKeys() ?? []).joined(separator: ","))
+        }
+    }
+
+    private func transitionSongContent(direction: SongChangeDirection?, animated: Bool) {
+        let layers = [artworkView.layer, titleLabel.layer, metadataLabel.layer, qualityLabel.layer]
+        let reduceMotion = reduceMotionEnabled()
+        for layer in layers {
+            layer.removeAnimation(forKey: Self.songChangeAnimationKey)
+            guard animated else { continue }
+            let transition = CATransition()
+            transition.duration = reduceMotion ? 0.18 : 0.24
+            transition.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            transition.type = .fade
+            if !reduceMotion, let direction = direction {
+                transition.type = .push
+                transition.subtype = direction == .next ? .fromRight : .fromLeft
+            }
+            transition.beginTime = layer.convertTime(CACurrentMediaTime(), from: nil)
+            layer.add(transition, forKey: Self.songChangeAnimationKey)
         }
     }
 
@@ -140,6 +192,7 @@ final class PlayerViewController: UIViewController, UIGestureRecognizerDelegate 
         configure(label: titleLabel, size: 18, weight: .bold, color: DesignSystem.primaryText)
         titleLabel.accessibilityIdentifier = "player.title"
         configure(label: metadataLabel, size: 13, weight: .regular, color: DesignSystem.secondaryText)
+        metadataLabel.accessibilityIdentifier = "player.metadata"
         configure(label: qualityLabel, size: 10, weight: .regular, color: DesignSystem.secondaryText)
         qualityLabel.accessibilityIdentifier = "player.quality"
         configure(label: elapsedLabel, size: 9, weight: .regular, color: DesignSystem.secondaryText)
@@ -332,8 +385,18 @@ final class PlayerViewController: UIViewController, UIGestureRecognizerDelegate 
 
     @objc private func swipedDown() { onDismissSwipe?() }
     @objc private func swipedUp() { onOpenQueue?() }
-    @objc private func swipedLeft() { onSkip?() }
-    @objc private func swipedRight() { onRewind?() }
+    @objc private func swipedLeft() {
+        gestureDirection = .next
+        defer { gestureDirection = nil }
+        onSkip?()
+    }
+    @objc private func swipedRight() {
+        // Previous may seek to zero instead of changing songs. Scope the hint to
+        // this action so a later automatic/queue change cannot inherit it.
+        gestureDirection = .previous
+        defer { gestureDirection = nil }
+        onRewind?()
+    }
 }
 
 private final class ArtworkShadowCanvasView: UIView {
