@@ -129,9 +129,12 @@ TEST_RUNNER_QOBUZ_DEMO_TOUR=1 xcodebuild test-without-building ...
 The checked-in demo media can be regenerated with:
 
 ```sh
-FFMPEG=ffmpeg   # trim to the app footage, speed up 1.5x, then palette-build the GIF
+FFMPEG=ffmpeg
+# 1.5x, trimmed to the app footage and past the library loader
 $FFMPEG -ss 9.5 -to 67 -i media/video/demo-tour-full.mp4 \
   -vf 'setpts=PTS/1.5,fps=30' -an -c:v libx264 -crf 21 media/video/demo-tour.mp4
+$FFMPEG -ss 6.5 -i media/video/demo-tour.mp4 -c:v libx264 -crf 21 \
+  -pix_fmt yuv420p -movflags +faststart /tmp/demo.mp4 && mv /tmp/demo.mp4 media/video/demo-tour.mp4
 $FFMPEG -i media/video/demo-tour.mp4 \
   -vf 'fps=12,scale=340:-1:flags=lanczos,split[a][b];[a]palettegen=max_colors=128[p];[b][p]paletteuse=dither=bayer:bayer_scale=3' \
   -loop 0 media/demo.gif
